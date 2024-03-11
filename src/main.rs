@@ -36,7 +36,7 @@ fn main() {
 }
 
 fn process_command<W: Write>(command: Vec<String>, output: &mut W) {
-    match command[0].as_str() {
+    match command[0].to_uppercase().as_str() {
         "PING" => {
             let response = "+PONG\r\n";
             output.write_all(response.as_bytes()).unwrap();
