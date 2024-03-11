@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context};
 use anyhow::{Ok, Result};
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 
 pub fn read_array_of_bulk_strings<R: BufRead>(reader: &mut R) -> Result<Vec<String>> {
     let len = read_prefixed_length("*", reader)?;
@@ -60,6 +60,12 @@ fn read_prefixed_length<R: BufRead>(prefix: &str, reader: &mut R) -> Result<usiz
         .context("failed to parse prefixed length")?;
 
     Ok(len)
+}
+
+pub fn write_bulk_string<W: Write>(value: &str, writer: &mut W) -> Result<()> {
+    write!(writer, "${}\r\n{}\r\n", value.len(), value).context("failed to write bulk string")?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
