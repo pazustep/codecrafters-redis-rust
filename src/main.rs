@@ -2,7 +2,7 @@ mod protocol;
 
 use std::{
     io::{BufReader, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
 };
 
 fn main() {
@@ -10,26 +10,28 @@ fn main() {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                println!("accepted new connection");
-
-                loop {
-                    let result = {
-                        let mut reader = BufReader::new(&stream);
-                        protocol::read_array_of_bulk_strings(&mut reader)
-                    };
-
-                    match result {
-                        Ok(command) => process_command(command, &mut stream),
-                        Err(e) => {
-                            eprintln!("failed to read command: {}", e);
-                            break;
-                        }
-                    }
-                }
+            Ok(stream) => {
+                std::thread::spawn(move || handle_connection(stream));
             }
             Err(e) => {
                 eprintln!("error: {}", e);
+            }
+        }
+    }
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    loop {
+        let result = {
+            let mut reader = BufReader::new(&stream);
+            protocol::read_array_of_bulk_strings(&mut reader)
+        };
+
+        match result {
+            Ok(command) => process_command(command, &mut stream),
+            Err(e) => {
+                eprintln!("failed to read command: {}", e);
+                break;
             }
         }
     }
