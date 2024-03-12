@@ -7,13 +7,23 @@ use anyhow::Context;
 
 #[non_exhaustive]
 pub enum RedisCommand {
-    Ping { message: Option<String> },
+    Ping {
+        message: Option<String>,
+    },
 
-    Echo { message: String },
+    Echo {
+        message: String,
+    },
 
-    Get { key: String },
+    Get {
+        key: String,
+    },
 
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        expiry: Option<u64>,
+    },
 }
 
 #[non_exhaustive]
@@ -32,7 +42,7 @@ impl RedisError {
     }
 
     fn wrong_number_of_arguments(command: &str) -> Self {
-        let message = format!("ERR wrong number of arguments for '{}' command", command);
+        let message = format!("wrong number of arguments for '{}' command", command);
         RedisError::CommandInvalid(message)
     }
 }
@@ -71,12 +81,33 @@ pub fn read_command<R: BufRead>(reader: &mut R) -> Result<RedisCommand, RedisErr
         }
         "SET" => {
             if array.len() < 2 {
-                Err(RedisError::wrong_number_of_arguments("set"))
-            } else {
-                let key = array.pop_front().unwrap();
-                let value = array.pop_front().unwrap();
-                Ok(RedisCommand::Set { key, value })
+                return Err(RedisError::wrong_number_of_arguments("set"));
             }
+
+            let key = array.pop_front().unwrap();
+            let value = array.pop_front().unwrap();
+            let option = array.pop_front().map(|s| s.to_uppercase());
+
+            let expiry = match option.as_deref() {
+                Some("PX") => {
+                    let px_value = array
+                        .pop_front()
+                        .ok_or_else(|| RedisError::wrong_number_of_arguments("set"))?;
+
+                    let px = px_value.parse::<u64>().map_err(|_| {
+                        RedisError::CommandInvalid(format!("invalid PX value: {}", px_value))
+                    })?;
+
+                    Some(px)
+                }
+                Some(option) => {
+                    let message = format!("unhandled SET option: {}", option);
+                    return Err(RedisError::CommandInvalid(message));
+                }
+                _ => None,
+            };
+
+            Ok(RedisCommand::Set { key, value, expiry })
         }
         _ => Err(RedisError::command_invalid("invalid command")),
     }
