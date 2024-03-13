@@ -1,20 +1,17 @@
-mod protocol;
-
-use protocol::{RedisCommand, RedisValue};
+use protocol::RedisValue;
+use server::{RedisCommandHandler, RedisServer};
+use std::io::{BufWriter, Write};
 use std::{
-    collections::{
-        hash_map::Entry::{Occupied, Vacant},
-        HashMap,
-    },
     io::BufReader,
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
+
+mod protocol;
+mod server;
 
 fn main() {
     let port = get_port_from_args().unwrap_or(DEFAULT_PORT);
-    let server = ServerState::new();
+    let server = RedisServer::new();
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
     println!("listening on {}", listener.local_addr().unwrap());
@@ -44,116 +41,19 @@ fn get_port_from_args() -> Option<u16> {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, mut server: ServerState) -> std::io::Result<()> {
+fn handle_connection(stream: TcpStream, mut server: RedisServer) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
+
     loop {
-        let command = {
-            let mut reader = BufReader::new(&stream);
-            protocol::read_command(&mut reader)
-        };
+        let command = protocol::read_command(&mut reader);
 
         let response = match command {
-            Ok(command) => command.process(&mut server),
+            Ok(command) => server.handle(command),
             Err(error) => RedisValue::BulkString(format!("ERR {}", error)),
         };
 
-        protocol::write_value(&mut stream, &response)?;
-    }
-}
-
-#[derive(Clone)]
-struct ServerState {
-    data: Arc<Mutex<HashMap<String, DataEntry>>>,
-}
-
-struct DataEntry {
-    value: String,
-    expiry: Option<Duration>,
-    last_accessed: Instant,
-}
-
-impl DataEntry {
-    fn is_expired(&self) -> bool {
-        match self.expiry {
-            None => false,
-            Some(expiry) => {
-                let duration = Instant::now().duration_since(self.last_accessed);
-                duration > expiry
-            }
-        }
-    }
-}
-
-impl ServerState {
-    pub fn new() -> Self {
-        Self {
-            data: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub fn set(&mut self, key: String, value: String, expiry: Option<u64>) {
-        let mut data = self.data.lock().unwrap();
-        let entry = DataEntry {
-            value,
-            expiry: expiry.map(Duration::from_millis),
-            last_accessed: Instant::now(),
-        };
-
-        data.insert(key, entry);
-    }
-
-    pub fn get(&mut self, key: String) -> Option<String> {
-        let mut data = self.data.lock().unwrap();
-
-        match data.entry(key) {
-            Vacant(_) => None,
-            Occupied(entry) if entry.get().is_expired() => {
-                entry.remove();
-                None
-            }
-            Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                entry.last_accessed = Instant::now();
-                Some(entry.value.clone())
-            }
-        }
-    }
-}
-
-trait CommandProcessor {
-    fn process(self, server: &mut ServerState) -> RedisValue;
-}
-
-fn ping_no_message() -> RedisValue {
-    RedisValue::SimpleString("PONG".to_string())
-}
-
-fn ping(message: String) -> RedisValue {
-    RedisValue::BulkString(message)
-}
-
-fn echo(message: String) -> RedisValue {
-    RedisValue::BulkString(message)
-}
-
-fn get(server: &mut ServerState, key: String) -> RedisValue {
-    server
-        .get(key)
-        .map_or(RedisValue::Nil, RedisValue::BulkString)
-}
-
-fn set(server: &mut ServerState, key: String, value: String, expiry: Option<u64>) -> RedisValue {
-    server.set(key, value, expiry);
-    RedisValue::SimpleString("OK".to_string())
-}
-
-impl CommandProcessor for RedisCommand {
-    fn process(self, server: &mut ServerState) -> RedisValue {
-        match self {
-            RedisCommand::Ping { message: None } => ping_no_message(),
-            RedisCommand::Ping { message: Some(msg) } => ping(msg),
-            RedisCommand::Echo { message } => echo(message),
-            RedisCommand::Get { key } => get(server, key),
-            RedisCommand::Set { key, value, expiry } => set(server, key, value, expiry),
-        }
+        protocol::write_value(&mut writer, &response)?;
+        writer.flush()?;
     }
 }

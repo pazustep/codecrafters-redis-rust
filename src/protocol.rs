@@ -7,6 +7,8 @@ use anyhow::Context;
 
 #[non_exhaustive]
 pub enum RedisCommand {
+    Noop,
+
     Ping {
         message: Option<String>,
     },
@@ -23,6 +25,10 @@ pub enum RedisCommand {
         key: String,
         value: String,
         expiry: Option<u64>,
+    },
+
+    Info {
+        sections: Vec<String>,
     },
 }
 
@@ -63,6 +69,7 @@ pub fn read_command<R: BufRead>(reader: &mut R) -> Result<RedisCommand, RedisErr
         .ok_or_else(|| RedisError::command_invalid("empty command array"))?;
 
     match command.to_uppercase().as_str() {
+        "" => Ok(RedisCommand::Noop),
         "PING" => Ok(RedisCommand::Ping {
             message: array.pop_front(),
         }),
@@ -109,6 +116,10 @@ pub fn read_command<R: BufRead>(reader: &mut R) -> Result<RedisCommand, RedisErr
 
             Ok(RedisCommand::Set { key, value, expiry })
         }
+        "INFO" => {
+            let sections = array.into();
+            Ok(RedisCommand::Info { sections })
+        }
         _ => Err(RedisError::command_invalid("invalid command")),
     }
 }
@@ -128,6 +139,10 @@ fn read_array_of_bulk_strings<R: BufRead>(reader: &mut R) -> Result<VecDeque<Str
 fn read_bulk_string<R: BufRead>(reader: &mut R) -> Result<String, RedisError> {
     let len = read_prefixed_length("$", reader)?;
 
+    if len == 0 {
+        return Ok("".to_string());
+    }
+
     let mut buffer = vec![0u8; len + 2];
     reader
         .read_exact(&mut buffer)
@@ -143,7 +158,7 @@ fn read_bulk_string<R: BufRead>(reader: &mut R) -> Result<String, RedisError> {
     }
 
     buffer.truncate(len);
-    let value = String::from_utf8(buffer).context("bulk string value isn't value UTF-8")?;
+    let value = String::from_utf8(buffer).context("bulk string value isn't valid UTF-8")?;
 
     Ok(value)
 }
@@ -159,6 +174,10 @@ fn read_prefixed_length<R: BufRead>(prefix: &str, reader: &mut R) -> Result<usiz
     reader
         .read_line(&mut buffer)
         .context("failed to read prefixed length")?;
+
+    if buffer.is_empty() {
+        return Ok(0);
+    }
 
     let read_prefix = &buffer[0..prefix.len()];
 
