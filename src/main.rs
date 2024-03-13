@@ -13,8 +13,11 @@ use std::{
 };
 
 fn main() {
+    let port = get_port_from_args().unwrap_or(DEFAULT_PORT);
     let server = ServerState::new();
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+    println!("listening on {}", listener.local_addr().unwrap());
 
     for stream in listener.incoming() {
         match stream {
@@ -26,6 +29,18 @@ fn main() {
                 eprintln!("error: {}", e);
             }
         }
+    }
+}
+
+static DEFAULT_PORT: u16 = 6379;
+
+fn get_port_from_args() -> Option<u16> {
+    let args = std::env::args().collect::<Vec<_>>();
+
+    if args.len() > 2 && args[1] == "--port" {
+        args[2].parse::<u16>().ok()
+    } else {
+        None
     }
 }
 

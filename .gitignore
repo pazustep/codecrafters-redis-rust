@@ -10,5 +10,6 @@ target/
 *.pdb
 *.rdb
 
-# VS Code files
+# IDE files
 .vscode
+.idea
