@@ -42,6 +42,11 @@ impl RedisServer {
 
         let mut replication = HashMap::new();
         replication.insert("role".to_string(), role.to_string());
+        replication.insert(
+            "master_replid".to_string(),
+            "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb ".to_string(),
+        );
+        replication.insert("master_repl_offset".to_string(), "0".to_string());
 
         let mut info = HashMap::new();
         info.insert("Replication".to_string(), replication);
