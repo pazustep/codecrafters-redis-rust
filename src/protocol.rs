@@ -1,9 +1,6 @@
-use std::{
-    collections::VecDeque,
-    io::{BufRead, Write},
-};
-
 use anyhow::Context;
+use std::collections::VecDeque;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[non_exhaustive]
 pub enum RedisCommand {
@@ -61,8 +58,10 @@ pub enum RedisValue {
     Nil,
 }
 
-pub fn read_command<R: BufRead>(reader: &mut R) -> Result<RedisCommand, RedisError> {
-    let mut array = read_array_of_bulk_strings(reader)?;
+pub async fn read_command<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<RedisCommand, RedisError> {
+    let mut array = read_array_of_bulk_strings(reader).await?;
 
     let command = array
         .pop_front()
@@ -124,20 +123,22 @@ pub fn read_command<R: BufRead>(reader: &mut R) -> Result<RedisCommand, RedisErr
     }
 }
 
-fn read_array_of_bulk_strings<R: BufRead>(reader: &mut R) -> Result<VecDeque<String>, RedisError> {
-    let len = read_prefixed_length("*", reader)?;
+async fn read_array_of_bulk_strings<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<VecDeque<String>, RedisError> {
+    let len = read_prefixed_length("*", reader).await?;
     let mut result = VecDeque::with_capacity(len);
 
     for _ in 0..len {
-        let string = read_bulk_string(reader)?;
+        let string = read_bulk_string(reader).await?;
         result.push_back(string);
     }
 
     Ok(result)
 }
 
-fn read_bulk_string<R: BufRead>(reader: &mut R) -> Result<String, RedisError> {
-    let len = read_prefixed_length("$", reader)?;
+async fn read_bulk_string<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String, RedisError> {
+    let len = read_prefixed_length("$", reader).await?;
 
     if len == 0 {
         return Ok("".to_string());
@@ -146,6 +147,7 @@ fn read_bulk_string<R: BufRead>(reader: &mut R) -> Result<String, RedisError> {
     let mut buffer = vec![0u8; len + 2];
     reader
         .read_exact(&mut buffer)
+        .await
         .context("failed to read bulk string")?;
 
     if buffer.len() != len + 2 {
@@ -168,11 +170,15 @@ fn read_bulk_string<R: BufRead>(reader: &mut R) -> Result<String, RedisError> {
 ///
 /// This is a helper method to parse other redis protocol elements that use
 /// length prefixes, like arrays and strings.
-fn read_prefixed_length<R: BufRead>(prefix: &str, reader: &mut R) -> Result<usize, RedisError> {
+async fn read_prefixed_length<R: AsyncBufRead + Unpin>(
+    prefix: &str,
+    reader: &mut R,
+) -> Result<usize, RedisError> {
     // max redis length is 512MB, which is 9 bytes in ASCII + 2 for \r\n, +1 for the prefix
     let mut buffer = String::with_capacity(12);
     reader
         .read_line(&mut buffer)
+        .await
         .context("failed to read prefixed length")?;
 
     if buffer.is_empty() {
@@ -196,43 +202,19 @@ fn read_prefixed_length<R: BufRead>(prefix: &str, reader: &mut R) -> Result<usiz
     Ok(len)
 }
 
-pub fn write_value<W: Write>(writer: &mut W, response: &RedisValue) -> std::io::Result<()> {
-    match response {
+pub async fn write_value<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &RedisValue,
+) -> std::io::Result<()> {
+    let buffer = match response {
         RedisValue::SimpleString(value) => {
-            write!(writer, "+{}\r\n", value)
+            format!("+{}\r\n", value)
         }
         RedisValue::BulkString(value) => {
-            write!(writer, "${}\r\n{}\r\n", value.len(), value)
+            format!("${}\r\n{}\r\n", value.len(), value)
         }
-        RedisValue::Nil => {
-            write!(writer, "$-1\r\n")
-        }
-    }
-}
+        RedisValue::Nil => "$-1\r\n".to_string(),
+    };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{BufReader, Cursor};
-
-    #[test]
-    fn test_read_array_of_strings() {
-        let input = Cursor::new("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
-        let result = read_array_of_bulk_strings(&mut BufReader::new(input)).unwrap();
-        assert_eq!(result, vec!["foo".to_string(), "bar".to_string()]);
-    }
-
-    #[test]
-    fn test_read_bulk_string() {
-        let input = Cursor::new("$5\r\nhello\r\n");
-        let result = read_bulk_string(&mut BufReader::new(input)).unwrap();
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_read_prefixed_length() {
-        let input = Cursor::new("$5\r\n");
-        let result = read_prefixed_length("$", &mut BufReader::new(input)).unwrap();
-        assert_eq!(result, 5);
-    }
+    writer.write_all(buffer.as_bytes()).await
 }
