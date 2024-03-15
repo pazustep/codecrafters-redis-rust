@@ -1,7 +1,7 @@
 use protocol::RedisValue;
 use server::{RedisCommandHandler, RedisServer};
 use std::io;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
@@ -11,9 +11,11 @@ mod server;
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = parse_args();
-    let server = RedisServer::new(args.replica_of);
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port)).await?;
 
+    let mut server = RedisServer::new(args.replica_of);
+    server.init().await?;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port)).await?;
     println!("listening on {}", listener.local_addr().unwrap());
     let mut tasks = JoinSet::new();
 
@@ -105,7 +107,6 @@ async fn handle_connection(mut stream: TcpStream, mut server: RedisServer) -> io
             Err(error) => RedisValue::BulkString(format!("ERR {}", error)),
         };
 
-        protocol::write_value(&mut writer, &response).await?;
-        writer.flush().await?;
+        response.write_to(&mut writer).await?;
     }
 }

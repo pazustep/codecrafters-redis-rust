@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 
 pub trait RedisCommandHandler {
     fn handle(&mut self, command: RedisCommand) -> RedisValue;
@@ -31,6 +32,7 @@ impl DataEntry {
 pub struct RedisServer {
     info: HashMap<String, HashMap<String, String>>,
     data: Arc<Mutex<HashMap<String, DataEntry>>>,
+    master: Option<String>,
 }
 
 impl RedisServer {
@@ -54,7 +56,18 @@ impl RedisServer {
         Self {
             info,
             data: Arc::new(Mutex::new(HashMap::new())),
+            master,
         }
+    }
+
+    pub async fn init(&mut self) -> std::io::Result<()> {
+        if let Some(master) = self.master.as_deref() {
+            let mut stream = TcpStream::connect(master).await?;
+            let command = RedisValue::Array(vec![RedisValue::BulkString("PING".to_string())]);
+            command.write_to(&mut stream).await?;
+        }
+
+        Ok(())
     }
 
     fn set(&mut self, key: String, value: String, expiry: Option<u64>) -> RedisValue {

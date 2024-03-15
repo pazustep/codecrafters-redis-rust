@@ -1,5 +1,6 @@
 use anyhow::Context;
 use std::collections::VecDeque;
+use std::io::Write as StdWrite;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[non_exhaustive]
@@ -48,14 +49,6 @@ impl RedisError {
         let message = format!("wrong number of arguments for '{}' command", command);
         RedisError::CommandInvalid(message)
     }
-}
-
-pub enum RedisValue {
-    SimpleString(String),
-
-    BulkString(String),
-
-    Nil,
 }
 
 pub async fn read_command<R: AsyncBufRead + Unpin>(
@@ -202,19 +195,41 @@ async fn read_prefixed_length<R: AsyncBufRead + Unpin>(
     Ok(len)
 }
 
-pub async fn write_value<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    response: &RedisValue,
-) -> std::io::Result<()> {
-    let buffer = match response {
-        RedisValue::SimpleString(value) => {
-            format!("+{}\r\n", value)
-        }
-        RedisValue::BulkString(value) => {
-            format!("${}\r\n{}\r\n", value.len(), value)
-        }
-        RedisValue::Nil => "$-1\r\n".to_string(),
-    };
+pub enum RedisValue {
+    SimpleString(String),
 
-    writer.write_all(buffer.as_bytes()).await
+    BulkString(String),
+
+    Array(Vec<RedisValue>),
+
+    Nil,
+}
+
+impl From<RedisValue> for Vec<u8> {
+    fn from(value: RedisValue) -> Self {
+        match value {
+            RedisValue::SimpleString(str) => format!("+{}\r\n", str).into_bytes(),
+            RedisValue::BulkString(str) => format!("${}\r\n{}\r\n", str.len(), str).into_bytes(),
+            RedisValue::Array(array) => {
+                let mut buffer = Vec::new();
+                write!(&mut buffer, "*{}\r\n", array.len()).unwrap();
+
+                for value in array {
+                    let value: Vec<u8> = value.into();
+                    buffer.extend(value);
+                }
+
+                buffer
+            }
+            RedisValue::Nil => "$-1\r\n".to_string().into_bytes(),
+        }
+    }
+}
+
+impl RedisValue {
+    pub async fn write_to<W: AsyncWrite + Unpin>(self, mut writer: W) -> std::io::Result<()> {
+        let bytes: Vec<u8> = self.into();
+        writer.write_all(&bytes).await?;
+        writer.flush().await
+    }
 }
