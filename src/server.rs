@@ -34,16 +34,21 @@ pub struct RedisServer {
 }
 
 impl RedisServer {
-    pub fn new() -> Self {
+    pub fn new(master: Option<String>) -> Self {
+        let role = match master {
+            Some(_) => "slave",
+            None => "master",
+        };
+
         let mut replication = HashMap::new();
-        replication.insert("role".to_string(), "master".to_string());
+        replication.insert("role".to_string(), role.to_string());
 
         let mut info = HashMap::new();
         info.insert("Replication".to_string(), replication);
 
         Self {
-            data: Arc::new(Mutex::new(HashMap::new())),
             info,
+            data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
