@@ -1,7 +1,8 @@
 use anyhow::Context;
 use std::collections::VecDeque;
-use std::io::Write as StdWrite;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::fmt::{Display, Formatter};
+use std::io;
+use std::io::{BufRead, Write as StdWrite, Write};
 
 #[non_exhaustive]
 pub enum RedisCommand {
@@ -28,6 +29,11 @@ pub enum RedisCommand {
     Info {
         sections: Vec<String>,
     },
+
+    Replconf {
+        key: String,
+        value: String,
+    },
 }
 
 #[non_exhaustive]
@@ -35,6 +41,9 @@ pub enum RedisCommand {
 pub enum RedisError {
     #[error("{0}")]
     CommandInvalid(String),
+
+    #[error("{0}")]
+    Protocol(String),
 
     #[error(transparent)]
     Unexpected(#[from] anyhow::Error),
@@ -49,16 +58,44 @@ impl RedisError {
         let message = format!("wrong number of arguments for '{}' command", command);
         RedisError::CommandInvalid(message)
     }
+
+    fn protocol(message: &str) -> Self {
+        Self::Protocol(message.to_string())
+    }
 }
 
-pub async fn read_command<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> Result<RedisCommand, RedisError> {
-    let mut array = read_array_of_bulk_strings(reader).await?;
+pub fn read_command<R: BufRead>(reader: &mut R) -> Result<RedisCommand, RedisError> {
+    match read_value(reader)? {
+        RedisValue::Array(command) => parse_command_from_values(command),
+        value => {
+            let message = format!("expected array, got value {}", value);
+            Err(RedisError::CommandInvalid(message))
+        }
+    }
+}
 
-    let command = array
-        .pop_front()
-        .ok_or_else(|| RedisError::command_invalid("empty command array"))?;
+fn parse_command_from_values(values: Vec<RedisValue>) -> Result<RedisCommand, RedisError> {
+    let mut output = VecDeque::with_capacity(values.len());
+
+    for (idx, value) in values.iter().enumerate() {
+        match value {
+            RedisValue::BulkString(str) => output.push_back(str.clone()),
+            val => {
+                let message = format!("expected bulk string in array index {}, got {}", idx, val);
+                return Err(RedisError::CommandInvalid(message));
+            }
+        }
+    }
+
+    if output.is_empty() {
+        Ok(RedisCommand::Noop)
+    } else {
+        parse_command_from_strings(output)
+    }
+}
+
+fn parse_command_from_strings(mut array: VecDeque<String>) -> Result<RedisCommand, RedisError> {
+    let command = array.pop_front().unwrap();
 
     match command.to_uppercase().as_str() {
         "" => Ok(RedisCommand::Noop),
@@ -112,84 +149,85 @@ pub async fn read_command<R: AsyncBufRead + Unpin>(
             let sections = array.into();
             Ok(RedisCommand::Info { sections })
         }
+        "REPLCONF" => {
+            if array.len() < 2 {
+                return Err(RedisError::wrong_number_of_arguments("replconf"));
+            }
+
+            let key = array.pop_front().unwrap();
+            let value = array.pop_front().unwrap();
+            Ok(RedisCommand::Replconf { key, value })
+        }
         _ => Err(RedisError::command_invalid("invalid command")),
     }
 }
 
-async fn read_array_of_bulk_strings<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> Result<VecDeque<String>, RedisError> {
-    let len = read_prefixed_length("*", reader).await?;
+pub fn read_value<R: BufRead>(reader: &mut R) -> Result<RedisValue, RedisError> {
+    let mut buffer = vec![0; 1];
+
+    reader
+        .read_exact(&mut buffer)
+        .map_err(|_| RedisError::protocol("can't read first byte of redis value"))?;
+
+    let prefix = buffer[0].into();
+
+    match prefix {
+        '+' => read_simple_string(reader),
+        '$' => read_bulk_string(reader),
+        '*' => read_array(reader),
+        ch => Err(RedisError::Protocol(format!("unexpected character {}", ch))),
+    }
+}
+
+fn read_simple_string<R: BufRead>(reader: &mut R) -> Result<RedisValue, RedisError> {
+    let mut buffer = String::new();
+
+    reader
+        .read_line(&mut buffer)
+        .map_err(|_| RedisError::protocol("can't read simple string"))?;
+
+    Ok(RedisValue::SimpleString(buffer))
+}
+
+fn read_bulk_string<R: BufRead>(reader: &mut R) -> Result<RedisValue, RedisError> {
+    let len = read_length(reader)?;
+
+    if len <= 0 {
+        Ok(RedisValue::Nil)
+    } else {
+        let len = len as usize;
+        let mut buffer = vec![0; len + 2];
+        reader
+            .read_exact(&mut buffer)
+            .context("failed to read bulk string value")?;
+        buffer.truncate(len);
+
+        let value = String::from_utf8(buffer).context("bulk string is invalid UTF-8")?;
+        Ok(RedisValue::BulkString(value))
+    }
+}
+
+fn read_array<R: BufRead>(reader: &mut R) -> Result<RedisValue, RedisError> {
+    let len = read_length(reader)? as usize;
     let mut result = VecDeque::with_capacity(len);
 
     for _ in 0..len {
-        let string = read_bulk_string(reader).await?;
-        result.push_back(string);
+        let value = read_value(reader)?;
+        result.push_back(value);
     }
 
-    Ok(result)
+    Ok(RedisValue::Array(result.into()))
 }
 
-async fn read_bulk_string<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String, RedisError> {
-    let len = read_prefixed_length("$", reader).await?;
-
-    if len == 0 {
-        return Ok("".to_string());
-    }
-
-    let mut buffer = vec![0u8; len + 2];
-    reader
-        .read_exact(&mut buffer)
-        .await
-        .context("failed to read bulk string")?;
-
-    if buffer.len() != len + 2 {
-        let message = format!(
-            "failed to read bulk string; expected {} bytes but got {}",
-            len + 2,
-            buffer.len()
-        );
-        return Err(RedisError::CommandInvalid(message));
-    }
-
-    buffer.truncate(len);
-    let value = String::from_utf8(buffer).context("bulk string value isn't valid UTF-8")?;
-
-    Ok(value)
-}
-
-/// Consumes a line from the reader and parses a length with an arbitrary
-/// one-byte prefix.
-///
-/// This is a helper method to parse other redis protocol elements that use
-/// length prefixes, like arrays and strings.
-async fn read_prefixed_length<R: AsyncBufRead + Unpin>(
-    prefix: &str,
-    reader: &mut R,
-) -> Result<usize, RedisError> {
-    // max redis length is 512MB, which is 9 bytes in ASCII + 2 for \r\n, +1 for the prefix
-    let mut buffer = String::with_capacity(12);
+fn read_length<R: BufRead>(reader: &mut R) -> Result<i32, RedisError> {
+    // max redis length is 512MB, which is 9 bytes in ASCII + 2 for \r\n
+    let mut buffer = String::with_capacity(11);
     reader
         .read_line(&mut buffer)
-        .await
         .context("failed to read prefixed length")?;
 
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-
-    let read_prefix = &buffer[0..prefix.len()];
-
-    if prefix != read_prefix {
-        let message = format!(
-            "failed to read prefixed length; expected prefix {} but got {}",
-            prefix, read_prefix
-        );
-        return Err(RedisError::CommandInvalid(message));
-    }
-
-    let len = buffer[prefix.len()..buffer.len() - 2]
-        .parse::<usize>()
+    let len = buffer[..buffer.len() - 2]
+        .parse::<i32>()
         .map_err(|e| RedisError::CommandInvalid(format!("invalid length: {}", e)))?;
 
     Ok(len)
@@ -205,9 +243,36 @@ pub enum RedisValue {
     Nil,
 }
 
-impl From<RedisValue> for Vec<u8> {
-    fn from(value: RedisValue) -> Self {
-        match value {
+impl RedisValue {
+    pub fn ok() -> Self {
+        Self::simple_string("OK")
+    }
+
+    pub fn simple_string(value: &str) -> Self {
+        Self::SimpleString(value.to_string())
+    }
+
+    pub fn bulk_string(value: &str) -> Self {
+        Self::BulkString(value.to_string())
+    }
+
+    pub fn command(command: &str, args: &[&str]) -> Self {
+        let mut array = Vec::with_capacity(args.len() + 1);
+        array.push(Self::bulk_string(command));
+        array.extend(args.iter().map(|arg| Self::bulk_string(arg)));
+        Self::Array(array)
+    }
+}
+
+impl RedisValue {
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let bytes = self.to_bytes();
+        writer.write_all(&bytes)?;
+        writer.flush()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
             RedisValue::SimpleString(str) => format!("+{}\r\n", str).into_bytes(),
             RedisValue::BulkString(str) => format!("${}\r\n{}\r\n", str.len(), str).into_bytes(),
             RedisValue::Array(array) => {
@@ -215,7 +280,7 @@ impl From<RedisValue> for Vec<u8> {
                 write!(&mut buffer, "*{}\r\n", array.len()).unwrap();
 
                 for value in array {
-                    let value: Vec<u8> = value.into();
+                    let value: Vec<u8> = value.to_bytes();
                     buffer.extend(value);
                 }
 
@@ -226,10 +291,21 @@ impl From<RedisValue> for Vec<u8> {
     }
 }
 
-impl RedisValue {
-    pub async fn write_to<W: AsyncWrite + Unpin>(self, mut writer: W) -> std::io::Result<()> {
-        let bytes: Vec<u8> = self.into();
-        writer.write_all(&bytes).await?;
-        writer.flush().await
+impl Display for RedisValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedisValue::SimpleString(value) => write!(f, "{}", value),
+            RedisValue::BulkString(value) => write!(f, "{}", value),
+            RedisValue::Array(array) => {
+                let value = array
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                write!(f, "{}", value)
+            }
+            RedisValue::Nil => write!(f, "_"),
+        }
     }
 }

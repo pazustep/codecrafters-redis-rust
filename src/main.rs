@@ -1,48 +1,13 @@
-use protocol::RedisValue;
-use server::{RedisCommandHandler, RedisServer};
-use std::io;
-use tokio::io::{BufReader, BufWriter};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
+use protocol::RedisError;
+use server::{RedisArguments, RedisServer};
 
 mod protocol;
 mod server;
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> Result<(), RedisError> {
     let args = parse_args();
-
-    let mut server = RedisServer::new(args.replica_of);
-    server.init().await?;
-
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", args.port)).await?;
-    println!("listening on {}", listener.local_addr().unwrap());
-    let mut tasks = JoinSet::new();
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                eprintln!("accepted connection from {}", peer);
-                let server = server.clone();
-                tasks.spawn(handle_connection(stream, server));
-            }
-            Err(e) => {
-                eprintln!("error accepting connection: {}", e);
-                break;
-            }
-        }
-    }
-
-    eprintln!("awaiting pending tasks...");
-    while tasks.join_next().await.is_some() {}
-    eprintln!("done.");
-
-    Ok(())
-}
-
-struct Arguments {
-    port: u16,
-    replica_of: Option<String>,
+    let server = RedisServer::new(args);
+    server.run()
 }
 
 #[derive(Clone, Copy)]
@@ -53,7 +18,7 @@ enum ArgState {
     ReplicaPort,
 }
 
-fn parse_args() -> Arguments {
+fn parse_args() -> RedisArguments {
     let mut state = ArgState::Normal;
     let mut port: Option<u16> = None;
     let mut replica_host: Option<String> = None;
@@ -86,27 +51,10 @@ fn parse_args() -> Arguments {
         format!("{}:{}", host, port)
     });
 
-    Arguments {
+    RedisArguments {
         port: port.unwrap_or(DEFAULT_PORT),
         replica_of,
     }
 }
 
 static DEFAULT_PORT: u16 = 6379;
-
-async fn handle_connection(mut stream: TcpStream, mut server: RedisServer) -> io::Result<()> {
-    let (read, write) = stream.split();
-    let mut reader = BufReader::new(read);
-    let mut writer = BufWriter::new(write);
-
-    loop {
-        let command = protocol::read_command(&mut reader).await;
-
-        let response = match command {
-            Ok(command) => server.handle(command),
-            Err(error) => RedisValue::BulkString(format!("ERR {}", error)),
-        };
-
-        response.write_to(&mut writer).await?;
-    }
-}
