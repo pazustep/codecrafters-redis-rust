@@ -2,7 +2,7 @@ use anyhow::Context;
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::io::{BufRead, Write as StdWrite, Write};
+use std::io::{BufRead, Write};
 
 #[non_exhaustive]
 pub enum RedisCommand {
@@ -269,6 +269,8 @@ pub enum RedisValue {
 
     BulkString(String),
 
+    BulkBytes(Vec<u8>),
+
     Array(Vec<RedisValue>),
 
     Nil,
@@ -297,28 +299,26 @@ impl RedisValue {
 
 impl RedisValue {
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        let bytes = self.to_bytes();
-        writer.write_all(&bytes)?;
-        writer.flush()
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
         match self {
-            RedisValue::SimpleString(str) => format!("+{}\r\n", str).into_bytes(),
-            RedisValue::BulkString(str) => format!("${}\r\n{}\r\n", str.len(), str).into_bytes(),
+            RedisValue::SimpleString(str) => write!(writer, "+{}\r\n", str),
+            RedisValue::BulkString(str) => write!(writer, "${}\r\n{}\r\n", str.len(), str),
+            RedisValue::BulkBytes(bytes) => {
+                write!(writer, "${}\r\n", bytes.len())?;
+                writer.write_all(bytes)
+            }
             RedisValue::Array(array) => {
-                let mut buffer = Vec::new();
-                write!(&mut buffer, "*{}\r\n", array.len()).unwrap();
+                write!(writer, "*{}\r\n", array.len())?;
 
                 for value in array {
-                    let value: Vec<u8> = value.to_bytes();
-                    buffer.extend(value);
+                    value.write_to(writer)?;
                 }
 
-                buffer
+                Ok(())
             }
-            RedisValue::Nil => "$-1\r\n".to_string().into_bytes(),
-        }
+            RedisValue::Nil => write!(writer, "$-1\r\n"),
+        }?;
+
+        writer.flush()
     }
 }
 
@@ -327,6 +327,7 @@ impl Display for RedisValue {
         match self {
             RedisValue::SimpleString(value) => write!(f, "{}", value),
             RedisValue::BulkString(value) => write!(f, "{}", value),
+            RedisValue::BulkBytes(_) => write!(f, "<bytes>"),
             RedisValue::Array(array) => {
                 let value = array
                     .iter()
