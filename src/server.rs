@@ -104,6 +104,7 @@ impl RedisServer {
             RedisValue::command("PING", &[]),
             RedisValue::command("REPLCONF", &["listening-port", &self.port.to_string()]),
             RedisValue::command("REPLCONF", &["capa", "psync2"]),
+            RedisValue::command("PSYNC", &["?", "-1"]),
         ];
 
         for command in commands {
@@ -150,6 +151,7 @@ impl RedisServer {
             RedisCommand::Get { key } => self.get(key),
             RedisCommand::Set { key, value, expiry } => self.set(key, value, expiry),
             RedisCommand::Replconf { .. } => RedisServer::replconf(),
+            RedisCommand::Psync { .. } => RedisServer::psync(),
             RedisCommand::Info { .. } => self.info(),
         }
     }
@@ -223,5 +225,10 @@ impl RedisServer {
 
     fn replconf() -> RedisValue {
         RedisValue::ok()
+    }
+
+    fn psync() -> RedisValue {
+        let response = "FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0";
+        RedisValue::simple_string(response)
     }
 }

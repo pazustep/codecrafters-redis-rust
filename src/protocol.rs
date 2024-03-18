@@ -34,6 +34,11 @@ pub enum RedisCommand {
         key: String,
         value: String,
     },
+
+    Psync {
+        master_replid: Option<String>,
+        master_repl_offset: Option<u32>,
+    },
 }
 
 #[non_exhaustive]
@@ -157,6 +162,32 @@ fn parse_command_from_strings(mut array: VecDeque<String>) -> Result<RedisComman
             let key = array.pop_front().unwrap();
             let value = array.pop_front().unwrap();
             Ok(RedisCommand::Replconf { key, value })
+        }
+        "PSYNC" => {
+            if array.len() < 2 {
+                return Err(RedisError::wrong_number_of_arguments("psync"));
+            }
+
+            let master_replid = array.pop_front().unwrap();
+            let master_replid = if master_replid == "?" {
+                None
+            } else {
+                Some(master_replid)
+            };
+
+            let master_repl_offset = array.pop_front().unwrap().parse::<i32>();
+            let master_repl_offset = if Ok(-1) == master_repl_offset {
+                None
+            } else if let Ok(offset) = master_repl_offset {
+                Some(offset as u32)
+            } else {
+                return Err(RedisError::command_invalid("invalid master_repl_offset"));
+            };
+
+            Ok(RedisCommand::Psync {
+                master_replid,
+                master_repl_offset,
+            })
         }
         _ => Err(RedisError::command_invalid("invalid command")),
     }
