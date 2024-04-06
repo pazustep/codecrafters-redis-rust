@@ -1,10 +1,13 @@
 use crate::protocol;
 use crate::protocol::{RedisCommand, RedisError, RedisValue};
 use anyhow::Context;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
+use std::collections::{
+    hash_map::Entry::{Occupied, Vacant},
+    VecDeque,
+};
 use std::fmt::Write as FmtWrite;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +41,7 @@ pub struct RedisServer {
     port: u16,
     master: Option<String>,
     data: Arc<Mutex<HashMap<String, DataEntry>>>,
+    replicas: Arc<Mutex<Vec<TcpStream>>>,
 }
 
 impl RedisServer {
@@ -49,6 +53,7 @@ impl RedisServer {
             port,
             master,
             data: Arc::new(Mutex::new(HashMap::new())),
+            replicas: Arc::new(Mutex::new(vec![])),
         }
     }
 
@@ -61,12 +66,16 @@ impl RedisServer {
         let server = self.clone();
         let listen_handle = std::thread::spawn(move || server.listen(&listener));
 
-        if self.master.is_some() {
-            let slave = self.clone();
-            std::thread::spawn(move || slave.init_slave());
+        if self.is_replica() {
+            let replica = self.clone();
+            std::thread::spawn(move || replica.run_replica());
         }
 
         listen_handle.join().unwrap()
+    }
+
+    fn is_replica(&self) -> bool {
+        self.master.is_some()
     }
 
     fn listen(&self, listener: &TcpListener) -> Result<(), RedisError> {
@@ -74,8 +83,8 @@ impl RedisServer {
             match listener.accept() {
                 Ok((stream, peer)) => {
                     eprintln!("accepted connection from {}", peer);
-                    let mut server = self.clone();
-                    std::thread::spawn(move || server.handle_connection(stream));
+                    let server = self.clone();
+                    std::thread::spawn(move || server.handle_connection(stream, true));
                 }
                 Err(e) => {
                     eprintln!("error accepting connection: {}", e);
@@ -87,14 +96,14 @@ impl RedisServer {
         Ok(())
     }
 
-    fn init_slave(&self) -> Result<(), RedisError> {
+    fn run_replica(&self) -> Result<(), RedisError> {
         let master = self.master.as_deref().unwrap();
 
         let stream = TcpStream::connect(master)
             .context(format!("failed to connect to master {}", master))?;
 
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut writer = BufWriter::new(stream);
+        let mut writer = BufWriter::new(stream.try_clone().unwrap());
 
         let commands = vec![
             RedisValue::command("PING", &[]),
@@ -111,67 +120,87 @@ impl RedisServer {
             protocol::read_value(&mut reader)?;
         }
 
+        // process commands received from the master
+        self.handle_connection(stream, false)
+            .context("I/O error handling replica connection")?;
+
         Ok(())
     }
 
-    fn handle_connection(&mut self, stream: TcpStream) -> io::Result<()> {
+    fn handle_connection(&self, stream: TcpStream, send_replies: bool) -> io::Result<()> {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut writer = BufWriter::new(stream);
+        let mut writer = BufWriter::new(stream.try_clone().unwrap());
 
         loop {
-            self.read_and_handle_command(&mut reader, &mut writer)?;
+            let command = protocol::read_command(&mut reader);
+
+            let response = match &command {
+                Ok(command) => self.handle_command(&stream, command),
+                Err(error) => vec![RedisValue::BulkString(format!("ERR {}", error))],
+            };
+
+            if send_replies {
+                for value in response {
+                    value.write_to(&mut writer)?;
+                }
+            }
+
+            if let Ok(command) = command {
+                if !self.is_replica() && command.is_write() {
+                    let mut replicas = self.replicas.lock().unwrap();
+                    let mut failed = VecDeque::with_capacity(replicas.len());
+
+                    for (index, replica) in replicas.iter_mut().enumerate() {
+                        let value = command.to_value();
+                        let mut writer = BufWriter::new(replica.try_clone().unwrap());
+
+                        if value.write_to(&mut writer).is_err() {
+                            eprintln!(
+                                "failed to write to replica {}; will drop",
+                                replica.peer_addr().unwrap()
+                            );
+                            failed.push_front(index)
+                        }
+                    }
+
+                    for index in failed {
+                        replicas.remove(index);
+                    }
+                }
+            }
         }
     }
 
-    fn read_and_handle_command<R: BufRead, W: Write>(
-        &mut self,
-        reader: &mut R,
-        writer: &mut W,
-    ) -> io::Result<()> {
-        let command = protocol::read_command(reader);
-
-        let response = match command {
-            Ok(command) => self.handle_command(command),
-            Err(error) => vec![RedisValue::BulkString(format!("ERR {}", error))],
-        };
-
-        for value in response {
-            value.write_to(writer)?;
-        }
-
-        Ok(())
-    }
-
-    fn handle_command(&mut self, command: RedisCommand) -> Vec<RedisValue> {
+    fn handle_command(&self, stream: &TcpStream, command: &RedisCommand) -> Vec<RedisValue> {
         match command {
             RedisCommand::Noop => vec![RedisValue::Nil],
             RedisCommand::Ping { message: None } => RedisServer::ping_no_message(),
             RedisCommand::Ping { message: Some(msg) } => RedisServer::ping(msg),
             RedisCommand::Echo { message } => RedisServer::echo(message),
             RedisCommand::Get { key } => self.get(key),
-            RedisCommand::Set { key, value, expiry } => self.set(key, value, expiry),
+            RedisCommand::Set { key, value, expiry } => self.set(key, value, expiry.to_owned()),
             RedisCommand::Replconf { .. } => RedisServer::replconf(),
-            RedisCommand::Psync { .. } => RedisServer::psync(),
+            RedisCommand::Psync { .. } => self.psync(stream),
             RedisCommand::Info { .. } => self.info(),
         }
     }
 
-    fn set(&mut self, key: String, value: String, expiry: Option<u64>) -> Vec<RedisValue> {
+    fn set(&self, key: &str, value: &str, expiry: Option<u64>) -> Vec<RedisValue> {
         let mut data = self.data.lock().unwrap();
         let entry = DataEntry {
-            value,
+            value: value.to_string(),
             expiry: expiry.map(Duration::from_millis),
             last_accessed: Instant::now(),
         };
 
-        data.insert(key, entry);
+        data.insert(key.to_string(), entry);
         vec![RedisValue::ok()]
     }
 
-    fn get(&mut self, key: String) -> Vec<RedisValue> {
+    fn get(&self, key: &str) -> Vec<RedisValue> {
         let mut data = self.data.lock().unwrap();
 
-        let value = match data.entry(key) {
+        let value = match data.entry(key.to_string()) {
             Vacant(_) => None,
             Occupied(entry) if entry.get().is_expired() => {
                 entry.remove();
@@ -194,12 +223,12 @@ impl RedisServer {
         vec![RedisValue::simple_string("PONG")]
     }
 
-    fn ping(message: String) -> Vec<RedisValue> {
-        vec![RedisValue::BulkString(message)]
+    fn ping(message: &str) -> Vec<RedisValue> {
+        vec![RedisValue::bulk_string(message)]
     }
 
-    fn echo(message: String) -> Vec<RedisValue> {
-        vec![RedisValue::BulkString(message)]
+    fn echo(message: &str) -> Vec<RedisValue> {
+        vec![RedisValue::bulk_string(message)]
     }
 
     fn info(&self) -> Vec<RedisValue> {
@@ -227,7 +256,7 @@ impl RedisServer {
         vec![RedisValue::ok()]
     }
 
-    fn psync() -> Vec<RedisValue> {
+    fn psync(&self, stream: &TcpStream) -> Vec<RedisValue> {
         let response = "FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0";
 
         let rdb_hex = concat!(
@@ -250,6 +279,9 @@ impl RedisServer {
             rdb_bytes.push(value);
             parse_buffer.clear();
         }
+
+        let mut replicas = self.replicas.lock().unwrap();
+        replicas.push(stream.try_clone().unwrap());
 
         vec![
             RedisValue::simple_string(response),

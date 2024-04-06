@@ -1,8 +1,8 @@
 use anyhow::Context;
-use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::io::{BufRead, Write};
+use std::{collections::VecDeque, vec};
 
 #[non_exhaustive]
 pub enum RedisCommand {
@@ -39,6 +39,55 @@ pub enum RedisCommand {
         master_replid: Option<String>,
         master_repl_offset: Option<u32>,
     },
+}
+
+impl RedisCommand {
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Set { .. })
+    }
+
+    pub fn to_value(&self) -> RedisValue {
+        match self {
+            Self::Noop => RedisValue::Nil,
+            Self::Ping { message } => match message {
+                Some(message) => RedisValue::command("PING", &[message]),
+                None => RedisValue::Array(vec![RedisValue::bulk_string("PING")]),
+            },
+            Self::Echo { message } => RedisValue::command("ECHO", &[message]),
+            Self::Get { key } => RedisValue::command("GET", &[key]),
+            Self::Set {
+                key,
+                value,
+                expiry: None,
+            } => RedisValue::command("SET", &[key, value]),
+            Self::Set {
+                key,
+                value,
+                expiry: Some(expiry),
+            } => RedisValue::command("SET", &[key, value, "PX", &expiry.to_string()]),
+            Self::Info { sections } => RedisValue::command(
+                "INFO",
+                &sections.iter().map(|x| x.as_ref()).collect::<Vec<_>>(),
+            ),
+            Self::Replconf { key, value } => RedisValue::command("REPLCONF", &[key, value]),
+            Self::Psync {
+                master_replid,
+                master_repl_offset,
+            } => {
+                let replid = match master_replid {
+                    Some(master_replid) => master_replid,
+                    None => "?",
+                };
+
+                let offset = match master_repl_offset {
+                    Some(offset) => offset.to_string(),
+                    None => "-1".to_string(),
+                };
+
+                RedisValue::command("PSYNC", &[replid, &offset])
+            }
+        }
+    }
 }
 
 #[non_exhaustive]
