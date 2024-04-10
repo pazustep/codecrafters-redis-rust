@@ -132,46 +132,63 @@ impl RedisServer {
         let mut writer = BufWriter::new(stream.try_clone().unwrap());
 
         loop {
-            let command = protocol::read_command(&mut reader);
-
-            let response = match &command {
-                Ok(command) => self.handle_command(&stream, command),
-                Err(error) => vec![RedisValue::BulkString(format!("ERR {}", error))],
-            };
-
-            if send_replies {
-                for value in response {
-                    value.write_to(&mut writer)?;
+            match protocol::read_command(&mut reader) {
+                Ok(command) => {
+                    self.handle_command(&stream, &mut writer, command, send_replies)?;
                 }
-            }
-
-            if let Ok(command) = command {
-                if !self.is_replica() && command.is_write() {
-                    let mut replicas = self.replicas.lock().unwrap();
-                    let mut failed = VecDeque::with_capacity(replicas.len());
-
-                    for (index, replica) in replicas.iter_mut().enumerate() {
-                        let value = command.to_value();
-                        let mut writer = BufWriter::new(replica.try_clone().unwrap());
-
-                        if value.write_to(&mut writer).is_err() {
-                            eprintln!(
-                                "failed to write to replica {}; will drop",
-                                replica.peer_addr().unwrap()
-                            );
-                            failed.push_front(index)
-                        }
-                    }
-
-                    for index in failed {
-                        replicas.remove(index);
-                    }
+                Err(error) => {
+                    let reply = RedisValue::BulkString(format!("ERR {}", error));
+                    reply.write_to(&mut writer)?;
                 }
             }
         }
     }
 
-    fn handle_command(&self, stream: &TcpStream, command: &RedisCommand) -> Vec<RedisValue> {
+    fn handle_command(
+        &self,
+        stream: &TcpStream,
+        writer: &mut BufWriter<TcpStream>,
+        command: RedisCommand,
+        send_replies: bool,
+    ) -> Result<(), io::Error> {
+        let response = self.apply_command(stream, &command);
+
+        if send_replies {
+            for value in response {
+                value.write_to(writer)?;
+            }
+        }
+
+        if !self.is_replica() && command.is_write() {
+            self.replicate_command(command);
+        }
+
+        Ok(())
+    }
+
+    fn replicate_command(&self, command: RedisCommand) {
+        let mut replicas = self.replicas.lock().unwrap();
+        let mut failed = VecDeque::with_capacity(replicas.len());
+
+        for (index, replica) in replicas.iter_mut().enumerate() {
+            let value = command.to_value();
+            let mut writer = BufWriter::new(replica.try_clone().unwrap());
+
+            if value.write_to(&mut writer).is_err() {
+                eprintln!(
+                    "failed to write to replica {}; will drop",
+                    replica.peer_addr().unwrap()
+                );
+                failed.push_front(index)
+            }
+        }
+
+        for index in failed {
+            replicas.remove(index);
+        }
+    }
+
+    fn apply_command(&self, stream: &TcpStream, command: &RedisCommand) -> Vec<RedisValue> {
         match command {
             RedisCommand::Noop => vec![RedisValue::Nil],
             RedisCommand::Ping { message: None } => RedisServer::ping_no_message(),
