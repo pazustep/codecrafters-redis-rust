@@ -1,16 +1,16 @@
 use crate::protocol;
 use crate::protocol::{RedisCommand, RedisError, RedisValue};
 use anyhow::Context;
-use std::collections::HashMap;
 use std::collections::{
     hash_map::Entry::{Occupied, Vacant},
     VecDeque,
 };
-use std::fmt::Write as FmtWrite;
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{collections::HashMap, ops::Deref};
+use std::{fmt::Write as FmtWrite, ops::DerefMut};
 use std::{io, vec};
 
 struct DataEntry {
@@ -42,18 +42,29 @@ pub struct RedisServer {
     master: Option<String>,
     data: Arc<Mutex<HashMap<String, DataEntry>>>,
     replicas: Arc<Mutex<Vec<TcpStream>>>,
+    replica_state: Arc<Mutex<ReplicaState>>,
+}
+
+enum ReplicaState {
+    Syncing { buffer: Vec<RedisCommand> },
+    Initialized,
 }
 
 impl RedisServer {
     pub fn new(args: RedisArguments) -> Self {
         let port = args.port;
         let master = args.replica_of;
+        let replica_state = match master {
+            Some(_) => ReplicaState::Syncing { buffer: vec![] },
+            None => ReplicaState::Initialized,
+        };
 
         Self {
             port,
             master,
             data: Arc::new(Mutex::new(HashMap::new())),
             replicas: Arc::new(Mutex::new(vec![])),
+            replica_state: Arc::new(Mutex::new(replica_state)),
         }
     }
 
@@ -68,7 +79,17 @@ impl RedisServer {
 
         if self.is_replica() {
             let replica = self.clone();
-            std::thread::spawn(move || replica.run_replica());
+            std::thread::spawn(move || {
+                let result = replica.run_replica();
+                match result {
+                    Ok(()) => {
+                        println!("replica connection closed");
+                    }
+                    Err(err) => {
+                        eprintln!("replica connection closed with error: {}", err)
+                    }
+                }
+            });
         }
 
         listen_handle.join().unwrap()
@@ -84,7 +105,17 @@ impl RedisServer {
                 Ok((stream, peer)) => {
                     eprintln!("accepted connection from {}", peer);
                     let server = self.clone();
-                    std::thread::spawn(move || server.handle_connection(stream, true));
+                    std::thread::spawn(move || {
+                        let result = server.handle_connection(stream, true);
+                        match result {
+                            Ok(_) => {
+                                eprintln!("connection from {} closed", peer);
+                            }
+                            Err(err) => {
+                                eprintln!("connection from {} closed with error: {}", peer, err)
+                            }
+                        }
+                    });
                 }
                 Err(e) => {
                     eprintln!("error accepting connection: {}", e);
@@ -117,12 +148,51 @@ impl RedisServer {
                 .write_to(&mut writer)
                 .context(format!("failed to send command {} to master", command))?;
 
-            protocol::read_value(&mut reader)?;
+            let reply = protocol::read_value(&mut reader)?;
+            println!("received reply to replica command {}: {}", &command, reply);
         }
 
+        println!("waiting for RDB file...");
+
+        match protocol::read_bulk_bytes(&mut reader)? {
+            RedisValue::BulkBytes(rdb) => {
+                println!("received RDB file with {} bytes", rdb.len());
+            }
+            _ => {
+                println!("received unexpected redis value");
+            }
+        }
+
+        {
+            println!("acquiring replica_state lock to replay buffered commands");
+            let mut replica_state = self.replica_state.lock().unwrap();
+
+            if let ReplicaState::Syncing { buffer } = replica_state.deref() {
+                println!("replaying {} commands", buffer.len());
+
+                for command in buffer {
+                    self.apply_command(&stream, command);
+                }
+            }
+
+            *replica_state = ReplicaState::Initialized;
+        }
+
+        println!("replica initialized");
+
         // process commands received from the master
-        self.handle_connection(stream, false)
-            .context("I/O error handling replica connection")?;
+        let result = self
+            .handle_connection(stream, false)
+            .context("I/O error handling replica connection");
+
+        match result {
+            Ok(()) => {
+                println!("closing replica connection");
+            }
+            Err(err) => {
+                eprintln!("replica connection closed with error {}", err);
+            }
+        }
 
         Ok(())
     }
@@ -133,7 +203,8 @@ impl RedisServer {
 
         loop {
             match protocol::read_command(&mut reader) {
-                Ok(command) => {
+                Ok(ref command) => {
+                    println!("handling command {}", command.to_value());
                     self.handle_command(&stream, &mut writer, command, send_replies)?;
                 }
                 Err(error) => {
@@ -148,15 +219,36 @@ impl RedisServer {
         &self,
         stream: &TcpStream,
         writer: &mut BufWriter<TcpStream>,
-        command: RedisCommand,
+        command: &RedisCommand,
         send_replies: bool,
-    ) -> Result<(), io::Error> {
-        let response = self.apply_command(stream, &command);
+    ) -> io::Result<()> {
+        if !command.is_replica() {
+            println!("acquiring replica_state lock to handle command");
+            let mut replica_state = self.replica_state.lock().unwrap();
+
+            if let ReplicaState::Syncing { buffer } = replica_state.deref_mut() {
+                println!("buffering command {}", command.to_value());
+                buffer.push(command.clone());
+                return Ok(());
+            }
+        }
+
+        let response = self.apply_command(stream, command);
 
         if send_replies {
             for value in response {
+                println!(
+                    "handled command {}; sending reply {}",
+                    command.to_value(),
+                    value
+                );
                 value.write_to(writer)?;
             }
+        } else {
+            println!(
+                "handled command {}; not sending a reply",
+                command.to_value()
+            );
         }
 
         if !self.is_replica() && command.is_write() {
@@ -166,7 +258,7 @@ impl RedisServer {
         Ok(())
     }
 
-    fn replicate_command(&self, command: RedisCommand) {
+    fn replicate_command(&self, command: &RedisCommand) {
         let mut replicas = self.replicas.lock().unwrap();
         let mut failed = VecDeque::with_capacity(replicas.len());
 
@@ -190,13 +282,13 @@ impl RedisServer {
 
     fn apply_command(&self, stream: &TcpStream, command: &RedisCommand) -> Vec<RedisValue> {
         match command {
-            RedisCommand::Noop => vec![RedisValue::Nil],
+            RedisCommand::Noop => vec![RedisValue::NullBulkString],
             RedisCommand::Ping { message: None } => RedisServer::ping_no_message(),
             RedisCommand::Ping { message: Some(msg) } => RedisServer::ping(msg),
             RedisCommand::Echo { message } => RedisServer::echo(message),
             RedisCommand::Get { key } => self.get(key),
             RedisCommand::Set { key, value, expiry } => self.set(key, value, expiry.to_owned()),
-            RedisCommand::Replconf { .. } => RedisServer::replconf(),
+            RedisCommand::Replconf { key, value } => RedisServer::replconf(key, value),
             RedisCommand::Psync { .. } => self.psync(stream),
             RedisCommand::Info { .. } => self.info(),
         }
@@ -231,7 +323,7 @@ impl RedisServer {
         };
 
         match value {
-            None => vec![RedisValue::Nil],
+            None => vec![RedisValue::NullBulkString],
             Some(value) => vec![RedisValue::BulkString(value)],
         }
     }
@@ -269,8 +361,11 @@ impl RedisServer {
         vec![RedisValue::BulkString(buffer)]
     }
 
-    fn replconf() -> Vec<RedisValue> {
-        vec![RedisValue::ok()]
+    fn replconf(key: &str, _value: &str) -> Vec<RedisValue> {
+        match key.to_lowercase().as_str() {
+            "getack" => vec![RedisValue::command("REPLCONF", &["ACK", "0"])],
+            _ => vec![RedisValue::ok()],
+        }
     }
 
     fn psync(&self, stream: &TcpStream) -> Vec<RedisValue> {
