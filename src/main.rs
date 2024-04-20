@@ -1,5 +1,11 @@
-// mod app;
+mod app;
 mod protocol;
-// mod server;
+mod server;
 
-fn main() {}
+use protocol::RedisError;
+
+#[tokio::main]
+async fn main() -> Result<(), RedisError> {
+    let options = app::parse_options();
+    server::RedisServer::start(options).await
+}

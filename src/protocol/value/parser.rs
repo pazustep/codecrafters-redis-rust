@@ -1,64 +1,14 @@
+use crate::protocol::RedisError;
+use crate::protocol::RedisValue;
 use anyhow::Context;
 use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
-
-use crate::protocol::RedisError;
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RedisValue {
-    SimpleString(String),
-
-    SimpleError(String),
-
-    Integer(i64),
-
-    BulkString(Vec<u8>),
-
-    Array(Vec<RedisValue>),
-
-    NullBulkString,
-
-    NullArray,
-}
-
-impl RedisValue {
-    pub fn simple_string(value: &str) -> Self {
-        Self::SimpleString(value.to_string())
-    }
-
-    pub fn simple_error(value: &str) -> Self {
-        Self::SimpleError(value.to_string())
-    }
-
-    pub fn integer(value: i64) -> Self {
-        Self::Integer(value)
-    }
-
-    pub fn bulk_string_from_bytes(value: Vec<u8>) -> Self {
-        Self::BulkString(value)
-    }
-
-    pub fn bulk_string(value: &str) -> Self {
-        Self::bulk_string_from_bytes(value.as_bytes().to_vec())
-    }
-
-    pub fn command(command: &str, args: &[&str]) -> Self {
-        let mut array = Vec::with_capacity(args.len() + 1);
-        array.push(Self::bulk_string(command));
-        array.extend(args.iter().map(|arg| Self::bulk_string(arg)));
-        Self::Array(array)
-    }
-
-    pub fn ok() -> Self {
-        Self::SimpleString("OK".to_string())
-    }
-}
 
 pub struct RedisValueParser<R> {
     reader: BufReader<R>,
 }
 
-impl<'a, R> RedisValueParser<R>
+impl<R> RedisValueParser<R>
 where
     R: AsyncRead + Unpin,
 {
@@ -67,9 +17,7 @@ where
     }
 
     pub async fn read_value(&mut self) -> Result<RedisValue, RedisError> {
-        let prefix = self.reader.read_u8().await?;
-
-        let prefix: char = prefix.into();
+        let prefix = self.reader.read_u8().await?.into();
 
         match prefix {
             '+' => self.read_simple_string().await,
@@ -82,6 +30,18 @@ where
                 Err(RedisError::Protocol(message))
             }
         }
+    }
+
+    pub async fn read_bytes(&mut self) -> Result<Vec<u8>, RedisError> {
+        let length = self.read_length().await?;
+
+        if length < 0 {
+            return Ok(vec![]);
+        }
+
+        let mut data = vec![0u8; length as usize];
+        self.reader.read_exact(&mut data).await?;
+        Ok(data)
     }
 
     async fn read_simple_string(&mut self) -> Result<RedisValue, RedisError> {
@@ -145,7 +105,7 @@ where
             let bytes_read = bytes.len();
 
             if bytes_read == 0 {
-                return Err(RedisError::protocol("EOF reached while looking for CR+LF"));
+                return Err(RedisError::EndOfInput);
             }
 
             // edge case: CR and LF across two reads
@@ -200,8 +160,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{RedisError, RedisValue, RedisValueParser};
-    use tokio::io::{AsyncReadExt, BufReader};
+    use super::*;
 
     #[tokio::test]
     async fn read_bytes_one_line() {
@@ -225,8 +184,8 @@ mod tests {
     async fn read_bytes_eof() {
         let result = read_line_bytes("OK").await;
         match result {
-            Err(_) => { /* ok */ }
-            Ok(_) => panic!("expected Err, got Ok"),
+            Err(RedisError::EndOfInput) => { /* ok */ }
+            value => panic!("expected end of input, got {:?}", value),
         }
     }
 
@@ -326,8 +285,8 @@ mod tests {
     #[tokio::test]
     async fn read_empty() {
         match read_value("").await {
-            Err(RedisError::Protocol(msg)) => assert_eq!(msg, "unexpected EOF"),
-            val => panic!("expected protocol error, got {:?}", val),
+            Err(RedisError::EndOfInput) => {}
+            val => panic!("expected end of input, got {:?}", val),
         }
     }
 
@@ -344,14 +303,5 @@ mod tests {
         let reader = BufReader::new(bytes);
         let mut parser = RedisValueParser::new(reader);
         parser.read_value().await
-    }
-}
-
-impl From<std::io::Error> for RedisError {
-    fn from(value: std::io::Error) -> Self {
-        match value.kind() {
-            std::io::ErrorKind::UnexpectedEof => RedisError::protocol("unexpected EOF"),
-            _ => RedisError::Unexpected(anyhow::Error::new(value)),
-        }
     }
 }

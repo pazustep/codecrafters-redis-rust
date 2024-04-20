@@ -1,10 +1,24 @@
+use std::io::Error as IoError;
+
 #[derive(thiserror::Error, Debug)]
 pub enum RedisError {
     #[error("{0}")]
     Protocol(String),
 
+    #[error("unexpected end of input")]
+    EndOfInput,
+
     #[error(transparent)]
     Unexpected(#[from] anyhow::Error),
+}
+
+impl From<IoError> for RedisError {
+    fn from(error: IoError) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => Self::EndOfInput,
+            _ => Self::Unexpected(anyhow::Error::new(error)),
+        }
+    }
 }
 
 impl RedisError {

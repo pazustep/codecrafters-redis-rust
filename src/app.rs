@@ -1,8 +1,4 @@
-pub fn main() -> Result<(), RedisError> {
-    let args = parse_args();
-    let server = RedisServer::new(args);
-    server.run()
-}
+use crate::server::RedisServerOptions;
 
 #[derive(Clone, Copy)]
 enum ArgState {
@@ -12,7 +8,7 @@ enum ArgState {
     ReplicaPort,
 }
 
-fn parse_args() -> RedisArguments {
+pub fn parse_options() -> RedisServerOptions {
     let mut state = ArgState::Normal;
     let mut port: Option<u16> = None;
     let mut replica_host: Option<String> = None;
@@ -45,7 +41,7 @@ fn parse_args() -> RedisArguments {
         format!("{}:{}", host, port)
     });
 
-    RedisArguments {
+    RedisServerOptions {
         port: port.unwrap_or(DEFAULT_PORT),
         replica_of,
     }
