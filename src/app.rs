@@ -1,4 +1,4 @@
-use crate::server::RedisServerOptions;
+use crate::server::ServerOptions;
 
 #[derive(Clone, Copy)]
 enum ArgState {
@@ -8,7 +8,7 @@ enum ArgState {
     ReplicaPort,
 }
 
-pub fn parse_options() -> RedisServerOptions {
+pub fn parse_options() -> ServerOptions {
     let mut state = ArgState::Normal;
     let mut port: Option<u16> = None;
     let mut replica_host: Option<String> = None;
@@ -41,7 +41,7 @@ pub fn parse_options() -> RedisServerOptions {
         format!("{}:{}", host, port)
     });
 
-    RedisServerOptions {
+    ServerOptions {
         port: port.unwrap_or(DEFAULT_PORT),
         replica_of,
     }

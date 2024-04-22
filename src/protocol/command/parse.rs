@@ -12,10 +12,7 @@ fn wrong_number_of_arguments(command: &str) -> FromValueError {
 pub fn from_value(value: Value) -> Result<Command, FromValueError> {
     match value {
         Value::Array(values) => from_values(values),
-        value => {
-            let message = format!("unexpected RESP value: {:?}", value);
-            Err(FromValueError(format!("value must be a RESP array")))
-        }
+        _ => Err(FromValueError(format!("value must be a RESP array"))),
     }
 }
 
@@ -31,7 +28,7 @@ fn from_values(values: Vec<Value>) -> Result<Command, FromValueError> {
             Value::BulkString(bytes) => {
                 parts.push_back(bytes);
             }
-            value => {
+            _ => {
                 return Err(FromValueError(format!(
                     "RESP array element at index {} must be a bulk string",
                     idx
@@ -183,9 +180,7 @@ mod tests {
     #[test]
     fn invalid_redis_value() {
         match from_value(Value::NullBulkString) {
-            Err(FromValueError(message)) => {
-                assert!(message.starts_with("unexpected RESP value"))
-            }
+            Err(FromValueError(message)) => assert_eq!(message, "value must be a RESP array"),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
@@ -193,7 +188,7 @@ mod tests {
     #[test]
     fn empty_array() {
         match from_value(Value::Array(vec![])) {
-            Err(FromValueError(message)) => assert_eq!(message, "empty RESP array"),
+            Err(FromValueError(message)) => assert_eq!(message, "RESP array must not be empty"),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
@@ -202,9 +197,10 @@ mod tests {
     fn malformed_array() {
         let value = Value::Array(vec![Value::simple_string("OK")]);
         match from_value(value) {
-            Err(FromValueError(message)) => {
-                assert!(message.starts_with("unexpected RESP value"))
-            }
+            Err(FromValueError(message)) => assert_eq!(
+                message,
+                "RESP array element at index 0 must be a bulk string"
+            ),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }

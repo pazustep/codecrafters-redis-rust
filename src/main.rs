@@ -1,11 +1,14 @@
 mod app;
+mod listener;
 mod protocol;
 mod server;
 
-use protocol::RedisError;
+use std::io;
 
 #[tokio::main]
-async fn main() -> Result<(), RedisError> {
+async fn main() -> Result<(), io::Error> {
     let options = app::parse_options();
-    server::RedisServer::start(options).await
+    let server = server::start(options.clone());
+    listener::start(options, server).await??;
+    Ok(())
 }

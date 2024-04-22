@@ -1,12 +1,10 @@
 mod database;
-mod handler;
-mod listener;
-mod replication;
+// mod replication;
 
-use crate::protocol::RedisError;
-
-use self::replication::ReplicationManagerHandle;
+use crate::protocol::{Command, Value};
 use database::Database;
+use std::{collections::HashMap, time::Duration};
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct ServerOptions {
@@ -14,29 +12,67 @@ pub struct ServerOptions {
     pub replica_of: Option<String>,
 }
 
-pub struct Server {
+#[derive(Clone)]
+pub struct ServerHandle {
+    sender: mpsc::UnboundedSender<CommandEnvelope>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to send command to server: {0:?}")]
+pub struct ServerSendError(Command);
+
+impl ServerHandle {
+    pub fn send(
+        &self,
+        command: Command,
+        reply_to: mpsc::UnboundedSender<Vec<Value>>,
+    ) -> Result<(), ServerSendError> {
+        let envelope = CommandEnvelope { command, reply_to };
+
+        self.sender
+            .send(envelope)
+            .map_err(|err| ServerSendError(err.0.command))
+    }
+}
+
+struct CommandEnvelope {
+    command: Command,
+    reply_to: mpsc::UnboundedSender<Vec<Value>>,
+}
+
+pub fn start(options: ServerOptions) -> ServerHandle {
+    let (tx, mut rx) = mpsc::unbounded_channel::<CommandEnvelope>();
+
+    tokio::spawn(async move {
+        let database = database::Database::new();
+        let mut server = Server { options, database };
+
+        loop {
+            match rx.recv().await {
+                None => {
+                    println!("server channel closed; exiting task");
+                    break;
+                }
+                Some(envelope) => {
+                    let response = server.handle(envelope.command);
+                    if let Err(_) = envelope.reply_to.send(response) {
+                        println!("failed to send response to client; ignoring");
+                    }
+                }
+            }
+        }
+    });
+
+    ServerHandle { sender: tx }
+}
+
+struct Server {
     options: ServerOptions,
     database: Database,
 }
 
-pub struct ServerStartError {}
-
-pub async fn start(options: ServerOptions) -> Result<(), ServerStartError> {
-    let database = database::Database::new();
-
-    let server = Self {
-        options,
-        database,
-        replication_manager,
-    };
-
-    listener::start(server)
-        .await
-        .context("failed to join listener task")?
-}
-
 impl Server {
-    pub fn new(options: ServerOptions) {
+    pub fn new(options: ServerOptions) -> Self {
         Self {
             options,
             database: Database::new(),
@@ -47,47 +83,46 @@ impl Server {
         self.options.port
     }
 
-    async fn handle(&self, command: RedisCommand) -> Vec<RedisValue> {
+    fn handle(&mut self, command: Command) -> Vec<Value> {
         match command {
-            RedisCommand::Ping { message } => self.ping(message),
-            RedisCommand::Echo { message } => self.echo(message),
-            RedisCommand::Get { key } => self.get(key).await,
-            RedisCommand::Set { key, value, expiry } => self.set(key, value, expiry).await,
-            RedisCommand::Info { .. } => self.info(),
-            _ => vec![RedisValue::simple_error("ERR unhandled command")],
+            Command::Ping { message } => self.ping(message),
+            Command::Echo { message } => self.echo(message),
+            Command::Get { key } => self.get(key),
+            Command::Set { key, value, expiry } => self.set(key, value, expiry),
+            Command::Info { .. } => self.info(),
+            _ => vec![Value::simple_error("ERR unhandled command")],
         }
     }
 
-    fn ping(&self, message: Option<Vec<u8>>) -> Vec<RedisValue> {
+    fn ping(&self, message: Option<Vec<u8>>) -> Vec<Value> {
         let response = match message {
-            None => RedisValue::simple_string("PONG"),
-            Some(message) => RedisValue::BulkString(message),
+            None => Value::simple_string("PONG"),
+            Some(message) => Value::BulkString(message),
         };
 
         vec![response]
     }
 
-    fn echo(&self, message: Vec<u8>) -> Vec<RedisValue> {
-        vec![RedisValue::BulkString(message)]
+    fn echo(&self, message: Vec<u8>) -> Vec<Value> {
+        vec![Value::BulkString(message)]
     }
 
-    async fn get(&self, key: Vec<u8>) -> Vec<RedisValue> {
-        match self.database().get(key).await {
-            Some(value) => vec![RedisValue::BulkString(value)],
-            None => vec![RedisValue::NullBulkString],
+    fn get(&mut self, key: Vec<u8>) -> Vec<Value> {
+        match self.database.get(key) {
+            Some(value) => vec![Value::BulkString(value)],
+            None => vec![Value::NullBulkString],
         }
     }
 
-    async fn set(&self, key: Vec<u8>, value: Vec<u8>, expiry: Option<u64>) -> Vec<RedisValue> {
-        let expiry = expiry.map(|px| Duration::from_millis(px));
-        self.database().set(key, value, expiry).await;
-        vec![RedisValue::simple_string("OK")]
+    fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expiry: Option<Duration>) -> Vec<Value> {
+        self.database.set(key, value, expiry);
+        vec![Value::simple_string("OK")]
     }
 
-    fn info(&self) -> Vec<RedisValue> {
+    fn info(&self) -> Vec<Value> {
         let mut info = HashMap::new();
 
-        if self.replication_manager().is_slave() {
+        if self.options.replica_of.is_some() {
             info.insert("role".to_string(), "slave".to_string());
         } else {
             info.insert("role".to_string(), "master".to_string());
@@ -104,6 +139,6 @@ impl Server {
             .collect::<Vec<_>>()
             .join("\r\n");
 
-        vec![RedisValue::BulkString(result.into_bytes())]
+        vec![Value::BulkString(result.into_bytes())]
     }
 }
