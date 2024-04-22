@@ -44,8 +44,7 @@ pub fn start(options: ServerOptions) -> ServerHandle {
     let (tx, mut rx) = mpsc::unbounded_channel::<CommandEnvelope>();
 
     tokio::spawn(async move {
-        let database = database::Database::new();
-        let mut server = Server { options, database };
+        let mut server = Server::new(options);
 
         loop {
             match rx.recv().await {
@@ -77,10 +76,6 @@ impl Server {
             options,
             database: Database::new(),
         }
-    }
-
-    pub fn port(&self) -> u16 {
-        self.options.port
     }
 
     fn handle(&mut self, command: Command) -> Vec<Value> {
