@@ -1,11 +1,11 @@
-mod parser;
+mod reader;
 mod writer;
 
-pub use parser::*;
+pub use reader::*;
 pub use writer::*;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum RedisValue {
+pub enum Value {
     SimpleString(String),
 
     SimpleError(String),
@@ -14,14 +14,14 @@ pub enum RedisValue {
 
     BulkString(Vec<u8>),
 
-    Array(Vec<RedisValue>),
+    Array(Vec<Value>),
 
     NullBulkString,
 
     NullArray,
 }
 
-impl RedisValue {
+impl Value {
     pub fn simple_string(value: &str) -> Self {
         Self::SimpleString(value.to_string())
     }

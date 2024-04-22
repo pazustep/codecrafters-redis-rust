@@ -1,28 +1,28 @@
-use crate::protocol::RedisValue;
+use crate::protocol::Value;
 use std::io;
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-pub struct RedisValueWriter<W> {
-    writer: BufWriter<W>,
+pub struct ValueWriter<W> {
+    writer: W,
 }
 
-impl<W> RedisValueWriter<W>
+impl<W> ValueWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    pub fn new(writer: BufWriter<W>) -> Self {
+    pub fn new(writer: W) -> Self {
         Self { writer }
     }
 
-    pub async fn write(&mut self, value: &RedisValue) -> io::Result<()> {
+    pub async fn write(&mut self, value: &Value) -> io::Result<()> {
         match value {
-            RedisValue::SimpleString(val) => self.write_simple_string(val).await,
-            RedisValue::SimpleError(val) => self.write_simple_error(val).await,
-            RedisValue::Integer(val) => self.write_integer(*val).await,
-            RedisValue::BulkString(bytes) => self.write_bulk_string(bytes.as_slice()).await,
-            RedisValue::Array(values) => self.write_array(values.as_slice()).await,
-            RedisValue::NullBulkString => self.write_null_bulk_string().await,
-            RedisValue::NullArray => self.write_null_array().await,
+            Value::SimpleString(val) => self.write_simple_string(val).await,
+            Value::SimpleError(val) => self.write_simple_error(val).await,
+            Value::Integer(val) => self.write_integer(*val).await,
+            Value::BulkString(bytes) => self.write_bulk_string(bytes.as_slice()).await,
+            Value::Array(values) => self.write_array(values.as_slice()).await,
+            Value::NullBulkString => self.write_null_bulk_string().await,
+            Value::NullArray => self.write_null_array().await,
         }?;
 
         self.writer.flush().await
@@ -57,7 +57,7 @@ where
         self.writer.write_all("\r\n".as_bytes()).await
     }
 
-    async fn write_array(&mut self, values: &[RedisValue]) -> io::Result<()> {
+    async fn write_array(&mut self, values: &[Value]) -> io::Result<()> {
         self.writer.write_all("*".as_bytes()).await?;
         self.writer
             .write_all(values.len().to_string().as_bytes())

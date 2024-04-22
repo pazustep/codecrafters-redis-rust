@@ -1,5 +1,5 @@
 use super::RedisServer;
-use crate::protocol::{RedisCommand, RedisError, RedisValue, RedisValueParser, RedisValueWriter};
+use crate::protocol::{RedisCommand, RedisError, RedisValue, ValueReader, ValueWriter};
 use std::io;
 use tokio::io::{AsyncWrite, BufReader, BufWriter};
 use tokio::net::TcpStream;

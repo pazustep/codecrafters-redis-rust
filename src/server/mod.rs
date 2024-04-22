@@ -3,71 +3,48 @@ mod handler;
 mod listener;
 mod replication;
 
-use std::collections::HashMap;
-use std::time::Duration;
+use crate::protocol::RedisError;
 
-use anyhow::Context;
-use tokio::io;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-
-use crate::protocol::{RedisCommand, RedisError, RedisValue};
-
-use self::database::DatabaseHandle;
 use self::replication::ReplicationManagerHandle;
+use database::Database;
 
 #[derive(Clone)]
-pub struct RedisServerOptions {
+pub struct ServerOptions {
     pub port: u16,
     pub replica_of: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct RedisServer {
-    options: RedisServerOptions,
-    database: DatabaseHandle,
-    replication_manager: ReplicationManagerHandle,
+pub struct Server {
+    options: ServerOptions,
+    database: Database,
 }
 
-impl RedisServer {
-    pub async fn start(options: RedisServerOptions) -> Result<(), RedisError> {
-        let database = database::start();
-        let replication_manager = replication::start(options.replica_of.clone()).await?;
+pub struct ServerStartError {}
 
-        let server = Self {
+pub async fn start(options: ServerOptions) -> Result<(), ServerStartError> {
+    let database = database::Database::new();
+
+    let server = Self {
+        options,
+        database,
+        replication_manager,
+    };
+
+    listener::start(server)
+        .await
+        .context("failed to join listener task")?
+}
+
+impl Server {
+    pub fn new(options: ServerOptions) {
+        Self {
             options,
-            database,
-            replication_manager,
-        };
-
-        listener::start(server)
-            .await
-            .context("failed to join listener task")?
+            database: Database::new(),
+        }
     }
 
     pub fn port(&self) -> u16 {
         self.options.port
-    }
-
-    pub fn database(&self) -> &DatabaseHandle {
-        &self.database
-    }
-
-    pub fn replication_manager(&self) -> &ReplicationManagerHandle {
-        &self.replication_manager
-    }
-
-    pub fn receive_command(&self, command: RedisCommand, reply_to: UnboundedSender<RedisValue>) {
-        let (tx, rx) = oneshot::channel();
-        let database = self.database.clone();
-
-        tokio::spawn(async move {
-            let response = database.handle(command).await;
-            let _ = tx.send(response);
-        });
-
-        rx
     }
 
     async fn handle(&self, command: RedisCommand) -> Vec<RedisValue> {

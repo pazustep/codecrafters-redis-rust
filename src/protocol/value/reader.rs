@@ -1,23 +1,47 @@
-use crate::protocol::RedisError;
-use crate::protocol::RedisValue;
-use anyhow::Context;
-use std::str::FromStr;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use crate::protocol::Value;
+use std::{io, str::FromStr};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-pub struct RedisValueParser<R> {
-    reader: BufReader<R>,
+/// A possible error reading a RESP value.
+///
+/// This is the error type for the [`read`] method on [`ValueReader`].
+#[derive(Debug, thiserror::Error)]
+pub enum ValueReadError {
+    /// EOF reached when _starting_ to read a RESP value
+    #[error("EOF reached; no value to read")]
+    EndOfInput,
+
+    /// The read data can't be correctly intepreted as a RESP value
+    #[error("{message}")]
+    Invalid { message: String, data: Vec<u8> },
+
+    /// An unexpected I/O error ocurred while reading data
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
-impl<R> RedisValueParser<R>
+pub struct ValueReader<R> {
+    reader: R,
+}
+
+impl<R> ValueReader<R>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncBufRead + Unpin,
 {
-    pub fn new(reader: BufReader<R>) -> Self {
+    pub fn new(reader: R) -> Self {
         Self { reader }
     }
 
-    pub async fn read_value(&mut self) -> Result<RedisValue, RedisError> {
-        let prefix = self.reader.read_u8().await?.into();
+    pub async fn read(&mut self) -> Result<Value, ValueReadError> {
+        let prefix = self
+            .reader
+            .read_u8()
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::UnexpectedEof => ValueReadError::EndOfInput,
+                _ => ValueReadError::Io(error),
+            })?
+            .into();
 
         match prefix {
             '+' => self.read_simple_string().await,
@@ -25,14 +49,17 @@ where
             ':' => self.read_integer().await,
             '$' => self.read_bulk_string().await,
             '*' => self.read_array().await,
-            _ => {
-                let message = format!("invalid RESP value: {}", prefix);
-                Err(RedisError::Protocol(message))
-            }
+            _ => Err(ValueReadError::Invalid {
+                message: format!("invalid RESP value: {}", prefix),
+                data: {
+                    let mut buffer = [0; 4];
+                    prefix.encode_utf8(&mut buffer).as_bytes().to_vec()
+                },
+            }),
         }
     }
 
-    pub async fn read_bytes(&mut self) -> Result<Vec<u8>, RedisError> {
+    pub async fn read_bytes(&mut self) -> Result<Vec<u8>, ValueReadError> {
         let length = self.read_length().await?;
 
         if length < 0 {
@@ -44,25 +71,25 @@ where
         Ok(data)
     }
 
-    async fn read_simple_string(&mut self) -> Result<RedisValue, RedisError> {
+    async fn read_simple_string(&mut self) -> Result<Value, ValueReadError> {
         let value = self.read_line().await?;
-        Ok(RedisValue::SimpleString(value))
+        Ok(Value::SimpleString(value))
     }
 
-    async fn read_simple_error(&mut self) -> Result<RedisValue, RedisError> {
+    async fn read_simple_error(&mut self) -> Result<Value, ValueReadError> {
         let value = self.read_line().await?;
-        Ok(RedisValue::SimpleError(value))
+        Ok(Value::SimpleError(value))
     }
 
-    async fn read_integer(&mut self) -> Result<RedisValue, RedisError> {
+    async fn read_integer(&mut self) -> Result<Value, ValueReadError> {
         let value = self.parse_string::<i64>("invalid integer value").await?;
-        Ok(RedisValue::Integer(value))
+        Ok(Value::Integer(value))
     }
 
-    async fn read_bulk_string(&mut self) -> Result<RedisValue, RedisError> {
+    async fn read_bulk_string(&mut self) -> Result<Value, ValueReadError> {
         let length = self.read_length().await?;
         if length < 0 {
-            return Ok(RedisValue::NullBulkString);
+            return Ok(Value::NullBulkString);
         }
 
         let mut data = vec![0u8; length as usize + 2];
@@ -70,32 +97,35 @@ where
         self.reader.read_exact(&mut data).await?;
 
         if data[data.len() - 2..] != [0xd, 0xa] {
-            return Err(RedisError::protocol("bulk string not terminated by \\r\\n"));
+            return Err(ValueReadError::Invalid {
+                message: "bulk string not terminated by \\r\\n".to_string(),
+                data,
+            });
         }
 
         data.resize(data.len() - 2, 0);
-        Ok(RedisValue::BulkString(data))
+        Ok(Value::BulkString(data))
     }
 
-    async fn read_array(&mut self) -> Result<RedisValue, RedisError> {
+    async fn read_array(&mut self) -> Result<Value, ValueReadError> {
         let length = self.read_length().await?;
 
         if length < 0 {
-            return Ok(RedisValue::NullArray);
+            return Ok(Value::NullArray);
         }
 
         let mut values = Vec::with_capacity(length as usize);
 
         for _ in 0..length {
             // pin is required to add indirection to a recursive call
-            let value = Box::pin(self.read_value()).await?;
+            let value = Box::pin(self.read()).await?;
             values.push(value);
         }
 
-        Ok(RedisValue::Array(values))
+        Ok(Value::Array(values))
     }
 
-    async fn read_line_bytes(&mut self) -> Result<Vec<u8>, RedisError> {
+    async fn read_line_bytes(&mut self) -> Result<Vec<u8>, ValueReadError> {
         let mut line = Vec::new();
         let mut cr_found = false;
         let reader = &mut self.reader;
@@ -105,7 +135,7 @@ where
             let bytes_read = bytes.len();
 
             if bytes_read == 0 {
-                return Err(RedisError::EndOfInput);
+                return Err(ValueReadError::Io(io::ErrorKind::UnexpectedEof.into()));
             }
 
             // edge case: CR and LF across two reads
@@ -133,27 +163,27 @@ where
         }
     }
 
-    async fn read_line(&mut self) -> Result<String, RedisError> {
+    async fn read_line(&mut self) -> Result<String, ValueReadError> {
         let bytes = self.read_line_bytes().await?;
-        let value = String::from_utf8(bytes).context("invalid UTF-8 in simple string")?;
-        Ok(value)
+
+        String::from_utf8(bytes).map_err(|error| ValueReadError::Invalid {
+            message: format!("invalid UTF-8 in simple string: {}", error),
+            data: error.into_bytes(),
+        })
     }
 
-    async fn parse_string<T>(&mut self, error: &str) -> Result<T, RedisError>
+    async fn parse_string<T>(&mut self, message: &str) -> Result<T, ValueReadError>
     where
         T: FromStr,
     {
         let value = self.read_line().await?;
-
-        let value: T = value.parse().map_err(|_| {
-            let message = format!("{}: {}", error, value);
-            RedisError::Protocol(message)
-        })?;
-
-        Ok(value)
+        value.parse().map_err(|_| ValueReadError::Invalid {
+            message: format!("{}: {}", message, value),
+            data: value.into_bytes(),
+        })
     }
 
-    async fn read_length(&mut self) -> Result<i32, RedisError> {
+    async fn read_length(&mut self) -> Result<i32, ValueReadError> {
         self.parse_string("invalid length").await
     }
 }
@@ -161,6 +191,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::BufReader;
 
     #[tokio::test]
     async fn read_bytes_one_line() {
@@ -171,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn read_bytes_two_lines() {
         let reader = BufReader::new("ONE\r\nTWO\r\n".as_bytes());
-        let mut parser = RedisValueParser::new(reader);
+        let mut parser = ValueReader::new(reader);
 
         let one = parser.read_line_bytes().await.unwrap();
         assert_eq!(one, "ONE".as_bytes());
@@ -184,7 +215,7 @@ mod tests {
     async fn read_bytes_eof() {
         let result = read_line_bytes("OK").await;
         match result {
-            Err(RedisError::EndOfInput) => { /* ok */ }
+            Err(ValueReadError::Io(cause)) if cause.kind() == io::ErrorKind::UnexpectedEof => {}
             value => panic!("expected end of input, got {:?}", value),
         }
     }
@@ -193,7 +224,7 @@ mod tests {
     async fn read_bytes_crlf_in_boundary() {
         let reader = AsyncReadExt::chain("OK\r".as_bytes(), "\nAGAIN\r\n".as_bytes());
         let reader = BufReader::new(reader);
-        let mut parser = RedisValueParser::new(reader);
+        let mut parser = ValueReader::new(reader);
 
         let line = parser.read_line_bytes().await.unwrap();
         assert_eq!(line, "OK".as_bytes());
@@ -202,16 +233,16 @@ mod tests {
         assert_eq!(line, "AGAIN".as_bytes());
     }
 
-    async fn read_line_bytes(buffer: &str) -> Result<Vec<u8>, RedisError> {
+    async fn read_line_bytes(buffer: &str) -> Result<Vec<u8>, ValueReadError> {
         let reader = BufReader::new(buffer.as_bytes());
-        let mut parser = RedisValueParser::new(reader);
+        let mut parser = ValueReader::new(reader);
         parser.read_line_bytes().await
     }
 
     #[tokio::test]
     async fn read_simple_string() {
         match read_value("+OK\r\n").await {
-            Ok(RedisValue::SimpleString(val)) => assert_eq!(val, "OK"),
+            Ok(Value::SimpleString(val)) => assert_eq!(val, "OK"),
             val => panic!("expected simple string, got {:?}", val),
         }
     }
@@ -219,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn read_simple_error() {
         match read_value("-ERR message\r\n").await {
-            Ok(RedisValue::SimpleError(val)) => assert_eq!(val, "ERR message"),
+            Ok(Value::SimpleError(val)) => assert_eq!(val, "ERR message"),
             val => panic!("expected simple error, got {:?}", val),
         }
     }
@@ -227,14 +258,14 @@ mod tests {
     #[tokio::test]
     async fn read_integer_valid() {
         match read_value(":1\r\n").await {
-            Ok(RedisValue::Integer(1)) => {}
+            Ok(Value::Integer(1)) => {}
             val => panic!("expected Integer(1), got {:?}", val),
         }
     }
     #[tokio::test]
     async fn read_integer_invalid() {
         match read_value(":x\r\n").await {
-            Err(RedisError::Protocol(_)) => {}
+            Err(ValueReadError::Invalid { .. }) => {}
             val => panic!("expected protocol error, got {:?}", val),
         }
     }
@@ -242,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn read_bulk_string_valid() {
         match read_value("$2\r\nOK\r\n").await {
-            Ok(RedisValue::BulkString(val)) => assert_eq!(val, "OK".as_bytes()),
+            Ok(Value::BulkString(val)) => assert_eq!(val, "OK".as_bytes()),
             val => panic!("expected BulkString(OK), got {:?}", val),
         }
     }
@@ -250,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn read_bulk_string_invalid() {
         match read_value("$2\r\nOKxx").await {
-            Err(RedisError::Protocol(_)) => {}
+            Err(ValueReadError::Invalid { .. }) => {}
             val => panic!("expected protocol error, got {:?}", val),
         }
     }
@@ -258,8 +289,8 @@ mod tests {
     #[tokio::test]
     async fn read_array_valid() {
         match read_value("*1\r\n$2\r\nOK\r\n").await {
-            Ok(RedisValue::Array(values)) => match values.as_slice() {
-                [RedisValue::BulkString(bytes)] => assert_eq!(bytes, "OK".as_bytes()),
+            Ok(Value::Array(values)) => match values.as_slice() {
+                [Value::BulkString(bytes)] => assert_eq!(bytes, "OK".as_bytes()),
                 val => panic!("expected OK, got {:?}", val),
             },
             val => panic!("expected array, got {:?}", val),
@@ -269,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn read_null_bulk_string() {
         match read_value("$-1\r\n").await {
-            Ok(RedisValue::NullBulkString) => {}
+            Ok(Value::NullBulkString) => {}
             val => panic!("expected NullBulkString, got {:?}", val),
         }
     }
@@ -277,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn read_null_array() {
         match read_value("*-1\r\n").await {
-            Ok(RedisValue::NullArray) => {}
+            Ok(Value::NullArray) => {}
             val => panic!("expected null array, got {:?}", val),
         }
     }
@@ -285,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn read_empty() {
         match read_value("").await {
-            Err(RedisError::EndOfInput) => {}
+            Err(ValueReadError::EndOfInput) => {}
             val => panic!("expected end of input, got {:?}", val),
         }
     }
@@ -293,15 +324,17 @@ mod tests {
     #[tokio::test]
     async fn read_invalid() {
         match read_value("x").await {
-            Err(RedisError::Protocol(msg)) => assert_eq!(msg, "invalid RESP value: x"),
+            Err(ValueReadError::Invalid { message, .. }) => {
+                assert_eq!(message, "invalid RESP value: x")
+            }
             val => panic!("expected protocol error, got {:?}", val),
         }
     }
 
-    async fn read_value(buffer: &str) -> Result<RedisValue, RedisError> {
+    async fn read_value(buffer: &str) -> Result<Value, ValueReadError> {
         let bytes = buffer.as_bytes();
         let reader = BufReader::new(bytes);
-        let mut parser = RedisValueParser::new(reader);
-        parser.read_value().await
+        let mut parser = ValueReader::new(reader);
+        parser.read().await
     }
 }

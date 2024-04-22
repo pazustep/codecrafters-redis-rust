@@ -1,31 +1,41 @@
-use crate::protocol::{RedisCommand, RedisError, RedisValue};
-use std::collections::VecDeque;
+use crate::protocol::{Command, Value};
+use std::{collections::VecDeque, time::Duration};
 
-pub fn from_value(value: RedisValue) -> Result<RedisCommand, RedisError> {
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct FromValueError(String);
+
+fn wrong_number_of_arguments(command: &str) -> FromValueError {
+    FromValueError(format!("wrong number of arguments for command {}", command))
+}
+
+pub fn from_value(value: Value) -> Result<Command, FromValueError> {
     match value {
-        RedisValue::Array(values) => from_values(values),
+        Value::Array(values) => from_values(values),
         value => {
             let message = format!("unexpected RESP value: {:?}", value);
-            Err(RedisError::protocol(&message))
+            Err(FromValueError(format!("value must be a RESP array")))
         }
     }
 }
 
-fn from_values(values: Vec<RedisValue>) -> Result<RedisCommand, RedisError> {
+fn from_values(values: Vec<Value>) -> Result<Command, FromValueError> {
     if values.is_empty() {
-        return Err(RedisError::protocol("empty RESP array"));
+        return Err(FromValueError(format!("RESP array must not be empty")));
     }
 
     let mut parts = VecDeque::with_capacity(values.len());
 
-    for value in values {
+    for (idx, value) in values.into_iter().enumerate() {
         match value {
-            RedisValue::BulkString(bytes) => {
+            Value::BulkString(bytes) => {
                 parts.push_back(bytes);
             }
             value => {
-                let message = format!("unexpected RESP value: {:?}", value);
-                return Err(RedisError::Protocol(message));
+                return Err(FromValueError(format!(
+                    "RESP array element at index {} must be a bulk string",
+                    idx
+                )));
             }
         }
     }
@@ -33,7 +43,7 @@ fn from_values(values: Vec<RedisValue>) -> Result<RedisCommand, RedisError> {
     from_parts(parts)
 }
 
-fn from_parts(mut values: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn from_parts(mut values: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     let command = values.pop_front().unwrap();
     let command = from_utf8(command)?;
 
@@ -49,91 +59,88 @@ fn from_parts(mut values: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError>
     }
 }
 
-fn parse_ping(mut args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn parse_ping(mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     let message = args.pop_front();
-    Ok(RedisCommand::Ping { message })
+    Ok(Command::Ping { message })
 }
 
-fn parse_echo(mut args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn parse_echo(mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     let message = args
         .pop_front()
-        .ok_or_else(|| RedisError::wrong_number_of_arguments("ECHO"))?;
-    Ok(RedisCommand::Echo { message })
+        .ok_or_else(|| wrong_number_of_arguments("ECHO"))?;
+    Ok(Command::Echo { message })
 }
 
-fn parse_get(mut args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn parse_get(mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     let key = args
         .pop_front()
-        .ok_or_else(|| RedisError::wrong_number_of_arguments("GET"))?;
+        .ok_or_else(|| wrong_number_of_arguments("GET"))?;
 
-    Ok(RedisCommand::Get { key })
+    Ok(Command::Get { key })
 }
 
-fn parse_set(mut args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn parse_set(mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     if args.len() < 2 {
-        return Err(RedisError::wrong_number_of_arguments("SET"));
+        return Err(wrong_number_of_arguments("SET"));
     }
 
     let key = args.pop_front().unwrap();
     let value = args.pop_front().unwrap();
     let expiry = parse_set_args(args)?;
 
-    Ok(RedisCommand::Set { key, value, expiry })
+    Ok(Command::Set { key, value, expiry })
 }
 
-fn parse_set_args(mut args: VecDeque<Vec<u8>>) -> Result<Option<u64>, RedisError> {
+fn parse_set_args(mut args: VecDeque<Vec<u8>>) -> Result<Option<Duration>, FromValueError> {
     match args.pop_front() {
         Some(arg) => match from_utf8(arg)?.to_uppercase().as_str() {
             "PX" => parse_set_expiry(args).map(Some),
-            arg => {
-                let message = format!("invalid SET argument: {}", arg);
-                Err(RedisError::Protocol(message))
-            }
+            arg => Err(FromValueError(format!("invalid SET argument: {}", arg))),
         },
         None => Ok(None),
     }
 }
 
-fn parse_set_expiry(mut args: VecDeque<Vec<u8>>) -> Result<u64, RedisError> {
+fn parse_set_expiry(mut args: VecDeque<Vec<u8>>) -> Result<Duration, FromValueError> {
     let bytes = args
         .pop_front()
-        .ok_or_else(|| RedisError::wrong_number_of_arguments("SET PX"))?;
+        .ok_or_else(|| wrong_number_of_arguments("SET PX"))?;
 
     let text = from_utf8(bytes)?;
 
     let expiry = text
         .parse::<u64>()
-        .map_err(|_| RedisError::protocol("invalid integer value for SET PX argument"))?;
+        .map_err(|_| FromValueError(format!("invalid integer value for SET PX argument")))?;
 
-    Ok(expiry)
+    Ok(Duration::from_millis(expiry))
 }
 
-fn parse_info(args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
-    Ok(RedisCommand::Info {
+fn parse_info(args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
+    Ok(Command::Info {
         sections: args.into(),
     })
 }
 
-fn parse_replconf(mut args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn parse_replconf(mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     if args.len() < 2 {
-        return Err(RedisError::wrong_number_of_arguments("REPLCONF"));
+        return Err(wrong_number_of_arguments("REPLCONF"));
     }
 
     let key = args.pop_front().unwrap();
     let value = args.pop_front().unwrap();
 
-    Ok(RedisCommand::Replconf { key, value })
+    Ok(Command::Replconf { key, value })
 }
 
-fn parse_psync(mut args: VecDeque<Vec<u8>>) -> Result<RedisCommand, RedisError> {
+fn parse_psync(mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
     if args.len() < 2 {
-        return Err(RedisError::wrong_number_of_arguments("PSYNC"));
+        return Err(wrong_number_of_arguments("PSYNC"));
     }
 
     let master_replid = parse_psync_replid(args.pop_front().unwrap());
     let master_repl_offset = parse_psync_offset(args.pop_front().unwrap())?;
 
-    Ok(RedisCommand::Psync {
+    Ok(Command::Psync {
         master_replid,
         master_repl_offset,
     })
@@ -147,13 +154,12 @@ fn parse_psync_replid(replid: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
-fn parse_psync_offset(offset: Vec<u8>) -> Result<Option<u32>, RedisError> {
+fn parse_psync_offset(offset: Vec<u8>) -> Result<Option<u32>, FromValueError> {
     let offset = from_utf8(offset)?;
 
-    let offset = offset.parse::<i64>().map_err(|_| {
-        let message = format!("invalid PSYNC offset: {}", offset);
-        RedisError::Protocol(message)
-    })?;
+    let offset = offset
+        .parse::<i64>()
+        .map_err(|_| FromValueError(format!("invalid PSYNC offset: {}", offset)))?;
 
     if offset < 0 {
         Ok(None)
@@ -162,13 +168,12 @@ fn parse_psync_offset(offset: Vec<u8>) -> Result<Option<u32>, RedisError> {
     }
 }
 
-fn invalid_command(command: &str) -> Result<RedisCommand, RedisError> {
-    let message = format!("invalid command: {}", command);
-    Err(RedisError::Protocol(message))
+fn invalid_command(command: &str) -> Result<Command, FromValueError> {
+    Err(FromValueError(format!("invalid command: {}", command)))
 }
 
-fn from_utf8(bytes: Vec<u8>) -> Result<String, RedisError> {
-    String::from_utf8(bytes).map_err(|_| RedisError::protocol("invalid UTF-8"))
+fn from_utf8(bytes: Vec<u8>) -> Result<String, FromValueError> {
+    String::from_utf8(bytes).map_err(|_| FromValueError(format!("invalid UTF-8")))
 }
 
 #[cfg(test)]
@@ -177,8 +182,8 @@ mod tests {
 
     #[test]
     fn invalid_redis_value() {
-        match from_value(RedisValue::NullBulkString) {
-            Err(RedisError::Protocol(message)) => {
+        match from_value(Value::NullBulkString) {
+            Err(FromValueError(message)) => {
                 assert!(message.starts_with("unexpected RESP value"))
             }
             value => panic!("expected protocol error, got {:?}", value),
@@ -187,17 +192,17 @@ mod tests {
 
     #[test]
     fn empty_array() {
-        match from_value(RedisValue::Array(vec![])) {
-            Err(RedisError::Protocol(message)) => assert_eq!(message, "empty RESP array"),
+        match from_value(Value::Array(vec![])) {
+            Err(FromValueError(message)) => assert_eq!(message, "empty RESP array"),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
 
     #[test]
     fn malformed_array() {
-        let value = RedisValue::Array(vec![RedisValue::simple_string("OK")]);
+        let value = Value::Array(vec![Value::simple_string("OK")]);
         match from_value(value) {
-            Err(RedisError::Protocol(message)) => {
+            Err(FromValueError(message)) => {
                 assert!(message.starts_with("unexpected RESP value"))
             }
             value => panic!("expected protocol error, got {:?}", value),
@@ -206,13 +211,13 @@ mod tests {
 
     #[test]
     fn ping_without_message() {
-        let command = RedisCommand::Ping { message: None };
+        let command = Command::Ping { message: None };
         assert_command_value(command, &["PING"]);
     }
 
     #[test]
     fn ping_with_message() {
-        let command = RedisCommand::Ping {
+        let command = Command::Ping {
             message: Some("message".as_bytes().to_vec()),
         };
         assert_command_value(command, &["PING", "message"]);
@@ -220,7 +225,7 @@ mod tests {
 
     #[test]
     fn echo() {
-        let command = RedisCommand::Echo {
+        let command = Command::Echo {
             message: "message".as_bytes().to_vec(),
         };
 
@@ -229,7 +234,7 @@ mod tests {
 
     #[test]
     fn get() {
-        let command = RedisCommand::Get {
+        let command = Command::Get {
             key: "key".as_bytes().to_vec(),
         };
 
@@ -238,7 +243,7 @@ mod tests {
 
     #[test]
     fn set_without_expiry() {
-        let command = RedisCommand::Set {
+        let command = Command::Set {
             key: "key".as_bytes().to_vec(),
             value: "value".as_bytes().to_vec(),
             expiry: None,
@@ -249,10 +254,10 @@ mod tests {
 
     #[test]
     fn set_with_expiry() {
-        let command = RedisCommand::Set {
+        let command = Command::Set {
             key: "key".as_bytes().to_vec(),
             value: "value".as_bytes().to_vec(),
-            expiry: Some(1000),
+            expiry: Some(Duration::from_millis(1000)),
         };
 
         assert_command_value(command, &["SET", "key", "value", "PX", "1000"]);
@@ -260,7 +265,7 @@ mod tests {
 
     #[test]
     fn info() {
-        let command = RedisCommand::Info {
+        let command = Command::Info {
             sections: vec![
                 "section1".as_bytes().to_vec(),
                 "section2".as_bytes().to_vec(),
@@ -272,7 +277,7 @@ mod tests {
 
     #[test]
     fn replconf() {
-        let command = RedisCommand::Replconf {
+        let command = Command::Replconf {
             key: "key".as_bytes().to_vec(),
             value: "value".as_bytes().to_vec(),
         };
@@ -282,7 +287,7 @@ mod tests {
 
     #[test]
     fn psync_empty() {
-        let command = RedisCommand::Psync {
+        let command = Command::Psync {
             master_replid: None,
             master_repl_offset: None,
         };
@@ -292,7 +297,7 @@ mod tests {
 
     #[test]
     fn psync_present() {
-        let command = RedisCommand::Psync {
+        let command = Command::Psync {
             master_replid: Some("replid".as_bytes().to_vec()),
             master_repl_offset: Some(100),
         };
@@ -303,13 +308,13 @@ mod tests {
     #[test]
     fn parse_ping_no_message() {
         let command = from_parts(&["PING"]).unwrap();
-        assert_eq!(command, RedisCommand::Ping { message: None })
+        assert_eq!(command, Command::Ping { message: None })
     }
 
     #[test]
     fn parse_ping_with_message() {
         match from_parts(&["PING", "message"]) {
-            Ok(RedisCommand::Ping {
+            Ok(Command::Ping {
                 message: Some(bytes),
             }) => assert_eq!(bytes, "message".as_bytes().to_vec()),
             value => panic!("expected PING, got {:?}", value),
@@ -319,7 +324,7 @@ mod tests {
     #[test]
     fn parse_echo_ok() {
         match from_parts(&["ECHO", "message"]) {
-            Ok(RedisCommand::Echo { message }) => {
+            Ok(Command::Echo { message }) => {
                 assert_eq!(message, "message".as_bytes().to_vec())
             }
             value => panic!("expected ECHO message, got {:?}", value),
@@ -329,7 +334,7 @@ mod tests {
     #[test]
     fn parse_echo_wrong_args() {
         match from_parts(&["ECHO"]) {
-            Err(RedisError::Protocol(_)) => {}
+            Err(FromValueError(_)) => {}
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
@@ -337,7 +342,7 @@ mod tests {
     #[test]
     fn parse_get_ok() {
         match from_parts(&["GET", "key"]) {
-            Ok(RedisCommand::Get { key }) => assert_eq!(key, "key".as_bytes().to_vec()),
+            Ok(Command::Get { key }) => assert_eq!(key, "key".as_bytes().to_vec()),
             value => panic!("expected GET key, got {:?}", value),
         }
     }
@@ -345,7 +350,7 @@ mod tests {
     #[test]
     fn parse_get_wrong_args() {
         match from_parts(&["GET"]) {
-            Err(RedisError::Protocol(_)) => {}
+            Err(FromValueError(_)) => {}
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
@@ -353,7 +358,7 @@ mod tests {
     #[test]
     fn parse_set_without_expiry() {
         match from_parts(&["SET", "key", "value"]) {
-            Ok(RedisCommand::Set {
+            Ok(Command::Set {
                 key,
                 value,
                 expiry: None,
@@ -368,9 +373,10 @@ mod tests {
     #[test]
     fn parse_set_px() {
         match from_parts(&["SET", "key", "value", "PX", "1000"]) {
-            Ok(RedisCommand::Set {
-                expiry: Some(1000), ..
-            }) => {}
+            Ok(Command::Set {
+                expiry: Some(duration),
+                ..
+            }) if duration.as_millis() == 1000 => {}
             value => panic!("expected SET key value PX 1000, got {:?}", value),
         }
     }
@@ -378,7 +384,7 @@ mod tests {
     #[test]
     fn parse_set_px_missing_arg() {
         match from_parts(&["SET", "key", "value", "PX"]) {
-            Err(RedisError::Protocol(message)) => {
+            Err(FromValueError(message)) => {
                 assert!(message.starts_with("wrong number of arguments"))
             }
             value => panic!("expected protocol error, got {:?}", value),
@@ -387,16 +393,16 @@ mod tests {
 
     #[test]
     fn parse_set_px_not_utf8() {
-        let value = RedisValue::Array(vec![
-            RedisValue::bulk_string("SET"),
-            RedisValue::bulk_string("key"),
-            RedisValue::bulk_string("value"),
-            RedisValue::bulk_string("PX"),
-            RedisValue::BulkString(vec![0xC3, 0x28]),
+        let value = Value::Array(vec![
+            Value::bulk_string("SET"),
+            Value::bulk_string("key"),
+            Value::bulk_string("value"),
+            Value::bulk_string("PX"),
+            Value::BulkString(vec![0xC3, 0x28]),
         ]);
 
-        match RedisCommand::try_from(value) {
-            Err(RedisError::Protocol(message)) => assert_eq!(message, "invalid UTF-8"),
+        match Command::try_from(value) {
+            Err(FromValueError(message)) => assert_eq!(message, "invalid UTF-8"),
             value => panic!("expected invalid UTF-8, got {:?}", value),
         }
     }
@@ -404,7 +410,7 @@ mod tests {
     #[test]
     fn parse_set_px_not_numeric() {
         match from_parts(&["SET", "key", "value", "PX", "abc"]) {
-            Err(RedisError::Protocol(message)) => assert!(message.starts_with("invalid integer")),
+            Err(FromValueError(message)) => assert!(message.starts_with("invalid integer")),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
@@ -412,7 +418,7 @@ mod tests {
     #[test]
     fn parse_set_unknown_arg() {
         match from_parts(&["SET", "key", "value", "EX"]) {
-            Err(RedisError::Protocol(message)) => {
+            Err(FromValueError(message)) => {
                 assert!(message.starts_with("invalid SET argument"))
             }
             value => panic!("expected protocol error, got {:?}", value),
@@ -422,7 +428,7 @@ mod tests {
     #[test]
     fn parse_set_wrong_number_of_args() {
         match from_parts(&["SET", "key"]) {
-            Err(RedisError::Protocol(message)) => {
+            Err(FromValueError(message)) => {
                 assert!(message.starts_with("wrong number of arguments"))
             }
             value => panic!("expected protocol error, got {:?}", value),
@@ -432,7 +438,7 @@ mod tests {
     #[test]
     fn parse_info_one_section() {
         match from_parts(&["INFO", "replication"]) {
-            Ok(RedisCommand::Info { sections }) => {
+            Ok(Command::Info { sections }) => {
                 assert_eq!(sections, vec!["replication".as_bytes().to_vec()])
             }
             value => panic!("expected INFO replication, got {:?}", value),
@@ -442,7 +448,7 @@ mod tests {
     #[test]
     fn parse_info_empty_sections() {
         match from_parts(&["INFO"]) {
-            Ok(RedisCommand::Info { sections }) => assert!(sections.is_empty()),
+            Ok(Command::Info { sections }) => assert!(sections.is_empty()),
             value => panic!("expected INFO, got {:?}", value),
         }
     }
@@ -450,7 +456,7 @@ mod tests {
     #[test]
     fn parse_replconf_ok() {
         match from_parts(&["REPLCONF", "key", "value"]) {
-            Ok(RedisCommand::Replconf { key, value }) => {
+            Ok(Command::Replconf { key, value }) => {
                 assert_eq!(key, "key".as_bytes().to_vec());
                 assert_eq!(value, "value".as_bytes().to_vec());
             }
@@ -461,7 +467,7 @@ mod tests {
     #[test]
     fn parse_replconf_wrong_args() {
         match from_parts(&["REPLCONF"]) {
-            Err(RedisError::Protocol(message)) => assert!(message.starts_with("wrong number")),
+            Err(FromValueError(message)) => assert!(message.starts_with("wrong number")),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
@@ -469,7 +475,7 @@ mod tests {
     #[test]
     fn parse_psync_defaults() {
         match from_parts(&["PSYNC", "?", "-1"]) {
-            Ok(RedisCommand::Psync {
+            Ok(Command::Psync {
                 master_replid: None,
                 master_repl_offset: None,
             }) => {}
@@ -480,7 +486,7 @@ mod tests {
     #[test]
     fn parse_psync_with_options() {
         match from_parts(&["PSYNC", "id", "0"]) {
-            Ok(RedisCommand::Psync {
+            Ok(Command::Psync {
                 master_replid: Some(id),
                 master_repl_offset: Some(0),
             }) => assert_eq!(id, "id".as_bytes().to_vec()),
@@ -491,7 +497,7 @@ mod tests {
     #[test]
     fn parse_psync_invalid_offset() {
         match from_parts(&["PSYNC", "?", "abc"]) {
-            Err(RedisError::Protocol(message)) => {
+            Err(FromValueError(message)) => {
                 assert!(message.starts_with("invalid PSYNC offset"))
             }
             value => panic!("expected protocol error, got {:?}", value),
@@ -501,29 +507,23 @@ mod tests {
     #[test]
     fn invalid_command() {
         match from_parts(&["XXX"]) {
-            Err(RedisError::Protocol(message)) => assert!(message.starts_with("invalid command")),
+            Err(FromValueError(message)) => assert!(message.starts_with("invalid command")),
             value => panic!("expected protocol error, got {:?}", value),
         }
     }
 
-    fn from_parts(parts: &[&str]) -> Result<RedisCommand, RedisError> {
-        let values = parts
-            .iter()
-            .map(|str| RedisValue::bulk_string(str))
-            .collect();
+    fn from_parts(parts: &[&str]) -> Result<Command, FromValueError> {
+        let values = parts.iter().map(|str| Value::bulk_string(str)).collect();
 
-        let array = RedisValue::Array(values);
+        let array = Value::Array(values);
         from_value(array)
     }
 
-    fn assert_command_value(command: RedisCommand, args: &[&str]) {
+    fn assert_command_value(command: Command, args: &[&str]) {
         let value = command.to_value();
-        let array = args
-            .iter()
-            .map(|str| RedisValue::bulk_string(str))
-            .collect();
+        let array = args.iter().map(|str| Value::bulk_string(str)).collect();
 
-        let expected = RedisValue::Array(array);
+        let expected = Value::Array(array);
         assert_eq!(value, expected);
     }
 }

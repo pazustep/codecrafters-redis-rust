@@ -1,10 +1,13 @@
-use crate::protocol::{RedisError, RedisValue};
+use std::time::Duration;
+
+use crate::protocol::Value;
+pub use parse::FromValueError;
 
 mod format;
 mod parse;
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum RedisCommand {
+pub enum Command {
     Ping {
         message: Option<Vec<u8>>,
     },
@@ -20,7 +23,7 @@ pub enum RedisCommand {
     Set {
         key: Vec<u8>,
         value: Vec<u8>,
-        expiry: Option<u64>,
+        expiry: Option<Duration>,
     },
 
     Info {
@@ -38,20 +41,20 @@ pub enum RedisCommand {
     },
 }
 
-impl RedisCommand {
+impl Command {
     pub fn is_write(&self) -> bool {
         matches!(self, Self::Set { .. })
     }
 
-    pub fn to_value(&self) -> RedisValue {
+    pub fn to_value(&self) -> Value {
         format::to_value(self)
     }
 }
 
-impl TryFrom<RedisValue> for RedisCommand {
-    type Error = RedisError;
+impl TryFrom<Value> for Command {
+    type Error = FromValueError;
 
-    fn try_from(value: RedisValue) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         parse::from_value(value)
     }
 }

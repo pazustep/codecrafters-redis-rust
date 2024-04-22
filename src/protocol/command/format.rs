@@ -1,33 +1,33 @@
-use crate::protocol::{RedisCommand, RedisValue};
+use crate::protocol::{Command, Value};
 
-pub fn to_value(command: &RedisCommand) -> RedisValue {
+pub fn to_value(command: &Command) -> Value {
     match command {
-        RedisCommand::Ping { message } => match message {
-            Some(message) => RedisValue::command("PING", &[message]),
-            None => RedisValue::Array(vec![RedisValue::bulk_string("PING")]),
+        Command::Ping { message } => match message {
+            Some(message) => Value::command("PING", &[message]),
+            None => Value::Array(vec![Value::bulk_string("PING")]),
         },
-        RedisCommand::Echo { message } => RedisValue::command("ECHO", &[message]),
-        RedisCommand::Get { key } => RedisValue::command("GET", &[key]),
-        RedisCommand::Set {
+        Command::Echo { message } => Value::command("ECHO", &[message]),
+        Command::Get { key } => Value::command("GET", &[key]),
+        Command::Set {
             key,
             value,
             expiry: None,
-        } => RedisValue::command("SET", &[key, value]),
-        RedisCommand::Set {
+        } => Value::command("SET", &[key, value]),
+        Command::Set {
             key,
             value,
             expiry: Some(expiry),
         } => {
             let px = "PX".as_bytes().to_vec();
-            let expiry = expiry.to_string().as_bytes().to_vec();
-            RedisValue::command("SET", &[key, value, &px, &expiry])
+            let expiry = expiry.as_millis().to_string().into_bytes();
+            Value::command("SET", &[key, value, &px, &expiry])
         }
-        RedisCommand::Info { sections } => RedisValue::command(
+        Command::Info { sections } => Value::command(
             "INFO",
             &sections.iter().map(|x| x.as_ref()).collect::<Vec<_>>(),
         ),
-        RedisCommand::Replconf { key, value } => RedisValue::command("REPLCONF", &[key, value]),
-        RedisCommand::Psync {
+        Command::Replconf { key, value } => Value::command("REPLCONF", &[key, value]),
+        Command::Psync {
             master_replid,
             master_repl_offset,
         } => {
@@ -43,24 +43,25 @@ pub fn to_value(command: &RedisCommand) -> RedisValue {
                 None => "-1".to_string(),
             };
 
-            RedisValue::command("PSYNC", &[replid, &offset.as_bytes().to_vec()])
+            Value::command("PSYNC", &[replid, &offset.as_bytes().to_vec()])
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{RedisCommand, RedisValue};
+    use crate::protocol::{Command, Value};
+    use std::time::Duration;
 
     #[test]
     fn ping_no_message() {
-        let command = RedisCommand::Ping { message: None };
+        let command = Command::Ping { message: None };
         assert_to_value(command, &["PING"]);
     }
 
     #[test]
     fn ping_with_message() {
-        let command = RedisCommand::Ping {
+        let command = Command::Ping {
             message: Some("message".as_bytes().to_vec()),
         };
         assert_to_value(command, &["PING", "message"])
@@ -68,7 +69,7 @@ mod tests {
 
     #[test]
     fn echo() {
-        let command = RedisCommand::Echo {
+        let command = Command::Echo {
             message: "message".as_bytes().to_vec(),
         };
         assert_to_value(command, &["ECHO", "message"]);
@@ -76,7 +77,7 @@ mod tests {
 
     #[test]
     fn get() {
-        let command = RedisCommand::Get {
+        let command = Command::Get {
             key: "key".as_bytes().to_vec(),
         };
         assert_to_value(command, &["GET", "key"]);
@@ -84,7 +85,7 @@ mod tests {
 
     #[test]
     fn set_no_expiry() {
-        let command = RedisCommand::Set {
+        let command = Command::Set {
             key: "key".as_bytes().to_vec(),
             value: "value".as_bytes().to_vec(),
             expiry: None,
@@ -94,17 +95,17 @@ mod tests {
 
     #[test]
     fn set_with_expiry() {
-        let command = RedisCommand::Set {
+        let command = Command::Set {
             key: "key".as_bytes().to_vec(),
             value: "value".as_bytes().to_vec(),
-            expiry: Some(1000),
+            expiry: Some(Duration::from_millis(1000)),
         };
         assert_to_value(command, &["SET", "key", "value", "PX", "1000"]);
     }
 
     #[test]
     fn info() {
-        let command = RedisCommand::Info {
+        let command = Command::Info {
             sections: vec!["replication".as_bytes().to_vec()],
         };
         assert_to_value(command, &["INFO", "replication"]);
@@ -112,7 +113,7 @@ mod tests {
 
     #[test]
     fn replconf() {
-        let command = RedisCommand::Replconf {
+        let command = Command::Replconf {
             key: "key".as_bytes().to_vec(),
             value: "value".as_bytes().to_vec(),
         };
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn psync_no_options() {
-        let command = RedisCommand::Psync {
+        let command = Command::Psync {
             master_replid: None,
             master_repl_offset: None,
         };
@@ -131,7 +132,7 @@ mod tests {
 
     #[test]
     fn psync_with_options() {
-        let command = RedisCommand::Psync {
+        let command = Command::Psync {
             master_replid: Some("id".as_bytes().to_vec()),
             master_repl_offset: Some(0),
         };
@@ -139,13 +140,13 @@ mod tests {
         assert_to_value(command, &["PSYNC", "id", "0"]);
     }
 
-    fn assert_to_value(command: RedisCommand, expected: &[&str]) {
+    fn assert_to_value(command: Command, expected: &[&str]) {
         let value = command.to_value();
 
-        let expected = RedisValue::Array(
+        let expected = Value::Array(
             expected
                 .iter()
-                .map(|part| RedisValue::bulk_string(part))
+                .map(|part| Value::bulk_string(part))
                 .collect(),
         );
 
