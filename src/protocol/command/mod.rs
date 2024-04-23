@@ -1,10 +1,12 @@
-use std::time::Duration;
-
-use crate::protocol::Value;
-pub use parse::FromValueError;
-
 mod format;
 mod parse;
+mod reader;
+
+use crate::protocol::Value;
+use std::time::Duration;
+
+pub use parse::FromValueError;
+pub use reader::{CommandReadError, CommandReader};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {

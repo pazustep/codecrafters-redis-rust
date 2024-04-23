@@ -1,8 +1,7 @@
-use crate::protocol::{Command, Value, ValueReadError, ValueReader, ValueWriter};
+use crate::protocol::{CommandReadError, CommandReader, Value, ValueReader, ValueWriter};
 use crate::server::{ServerHandle, ServerOptions};
-
 use std::io;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -65,23 +64,23 @@ async fn handle_client_reader<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    let mut reader = ValueReader::new(BufReader::new(socket_reader));
+    let mut reader = CommandReader::new(ValueReader::new(BufReader::new(socket_reader)));
 
     loop {
-        match read_command(&mut reader).await {
-            ReadCommandResult::Success(command) => {
+        match reader.read().await {
+            Ok(command) => {
                 if let Err(err) = server.send(command, values_sender.clone()) {
                     println!("failed to send command to server: {:?}", err);
                     break;
                 }
             }
-            ReadCommandResult::Invalid(values) => {
+            Err(CommandReadError::Invalid(values)) => {
                 if let Err(err) = values_sender.send(values) {
                     println!("failed to send invalid response to client: {:?}", err);
                     break;
                 }
             }
-            ReadCommandResult::Stop => {
+            Err(CommandReadError::Stop) => {
                 break;
             }
         }
@@ -102,40 +101,6 @@ async fn handle_client_writer<W>(
                 println!("error writing value to client: {}", error);
                 return;
             }
-        }
-    }
-}
-
-enum ReadCommandResult {
-    Success(Command),
-    Invalid(Vec<Value>),
-    Stop,
-}
-
-async fn read_command<R>(reader: &mut ValueReader<R>) -> ReadCommandResult
-where
-    R: AsyncBufRead + Unpin,
-{
-    match reader.read().await {
-        Ok(value) => parse_command(value),
-        Err(ValueReadError::EndOfInput) => ReadCommandResult::Stop,
-        Err(ValueReadError::Invalid { message, .. }) => {
-            let message = format!("invalid RESP value: {}", message);
-            ReadCommandResult::Invalid(vec![Value::SimpleError(message)])
-        }
-        Err(err) => {
-            println!("I/O error reading command: {}", err);
-            ReadCommandResult::Stop
-        }
-    }
-}
-
-fn parse_command(value: Value) -> ReadCommandResult {
-    match Command::try_from(value) {
-        Ok(command) => ReadCommandResult::Success(command),
-        Err(err) => {
-            let message = format!("{}", err);
-            ReadCommandResult::Invalid(vec![Value::SimpleError(message)])
         }
     }
 }

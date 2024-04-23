@@ -1,5 +1,5 @@
 mod database;
-// mod replication;
+mod replication;
 
 use crate::protocol::{Command, Value};
 use database::Database;
@@ -41,28 +41,35 @@ struct CommandEnvelope {
 }
 
 pub fn start(options: ServerOptions) -> ServerHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel::<CommandEnvelope>();
+    let (tx, rx) = mpsc::unbounded_channel::<CommandEnvelope>();
+    let server = ServerHandle { sender: tx };
 
-    tokio::spawn(async move {
-        let mut server = Server::new(options);
+    replication::start(options.clone(), server.clone());
+    tokio::spawn(async move { command_loop(options, rx).await });
 
-        loop {
-            match rx.recv().await {
-                None => {
-                    println!("server channel closed; exiting task");
-                    break;
-                }
-                Some(envelope) => {
-                    let response = server.handle(envelope.command);
-                    if let Err(_) = envelope.reply_to.send(response) {
-                        println!("failed to send response to client; ignoring");
-                    }
+    server
+}
+
+async fn command_loop(
+    options: ServerOptions,
+    mut receiver: mpsc::UnboundedReceiver<CommandEnvelope>,
+) {
+    let mut server = Server::new(options);
+
+    loop {
+        match receiver.recv().await {
+            None => {
+                println!("server channel closed; exiting task");
+                break;
+            }
+            Some(envelope) => {
+                let response = server.handle(envelope.command);
+                if envelope.reply_to.send(response).is_err() {
+                    println!("failed to send response to client; ignoring");
                 }
             }
         }
-    });
-
-    ServerHandle { sender: tx }
+    }
 }
 
 struct Server {
