@@ -11,7 +11,7 @@ pub enum ValueReadError {
     #[error("EOF reached; no value to read")]
     EndOfInput,
 
-    /// The read data can't be correctly intepreted as a RESP value
+    /// The read data can't be correctly interpreted as a RESP value
     #[error("{message}")]
     Invalid { message: String, data: Vec<u8> },
 
@@ -33,15 +33,7 @@ where
     }
 
     pub async fn read(&mut self) -> Result<Value, ValueReadError> {
-        let prefix = self
-            .reader
-            .read_u8()
-            .await
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::UnexpectedEof => ValueReadError::EndOfInput,
-                _ => ValueReadError::Io(error),
-            })?
-            .into();
+        let prefix = self.read_char().await?;
 
         match prefix {
             '+' => self.read_simple_string().await,
@@ -59,7 +51,30 @@ where
         }
     }
 
+    async fn read_char(&mut self) -> Result<char, ValueReadError> {
+        let ch = self
+            .reader
+            .read_u8()
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::UnexpectedEof => ValueReadError::EndOfInput,
+                _ => ValueReadError::Io(error),
+            })?
+            .into();
+
+        Ok(ch)
+    }
+
     pub async fn read_bytes(&mut self) -> Result<Vec<u8>, ValueReadError> {
+        let prefix = self.read_char().await?;
+
+        if prefix != '$' {
+            return Err(ValueReadError::Invalid {
+                message: "invalid RESP prefix for bulk bytes".to_string(),
+                data: vec![prefix as u8],
+            });
+        }
+
         let length = self.read_length().await?;
 
         if length < 0 {

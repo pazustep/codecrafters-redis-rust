@@ -19,8 +19,9 @@ where
             Value::SimpleString(val) => self.write_simple_string(val).await,
             Value::SimpleError(val) => self.write_simple_error(val).await,
             Value::Integer(val) => self.write_integer(*val).await,
-            Value::BulkString(bytes) => self.write_bulk_string(bytes.as_slice()).await,
-            Value::Array(values) => self.write_array(values.as_slice()).await,
+            Value::BulkString(bytes) => self.write_bulk_string(&bytes).await,
+            Value::BulkBytes(bytes) => self.write_bulk_bytes(&bytes).await,
+            Value::Array(values) => self.write_array(&values).await,
             Value::NullBulkString => self.write_null_bulk_string().await,
             Value::NullArray => self.write_null_array().await,
         }?;
@@ -48,13 +49,16 @@ where
     }
 
     async fn write_bulk_string(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.write_all("$".as_bytes()).await?;
-        self.writer
-            .write_all(bytes.len().to_string().as_bytes())
-            .await?;
-        self.writer.write_all("\r\n".as_bytes()).await?;
-        self.writer.write_all(bytes).await?;
+        self.write_bulk_bytes(bytes).await?;
         self.writer.write_all("\r\n".as_bytes()).await
+    }
+
+    async fn write_bulk_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let len = bytes.len().to_string();
+        self.writer.write_all("$".as_bytes()).await?;
+        self.writer.write_all(len.as_bytes()).await?;
+        self.writer.write_all("\r\n".as_bytes()).await?;
+        self.writer.write_all(bytes).await
     }
 
     async fn write_array(&mut self, values: &[Value]) -> io::Result<()> {

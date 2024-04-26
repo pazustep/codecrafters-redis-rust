@@ -14,6 +14,8 @@ pub enum Value {
 
     BulkString(Vec<u8>),
 
+    BulkBytes(Vec<u8>),
+
     Array(Vec<Value>),
 
     NullBulkString,

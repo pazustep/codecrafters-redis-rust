@@ -1,3 +1,5 @@
+use std::error::Error;
+
 use crate::protocol::{Command, Value, ValueReadError, ValueReader};
 use tokio::io::AsyncBufRead;
 
@@ -10,7 +12,7 @@ pub enum CommandReadError {
     Invalid(Vec<Value>),
 
     #[error("fatal error reading command")]
-    Stop,
+    Stop(Option<Box<dyn Error>>),
 }
 
 impl<R> CommandReader<R>
@@ -24,14 +26,14 @@ where
     pub async fn read(&mut self) -> Result<Command, CommandReadError> {
         match self.reader.read().await {
             Ok(value) => parse_command(value),
-            Err(ValueReadError::EndOfInput) => Err(CommandReadError::Stop),
+            Err(ValueReadError::EndOfInput) => Err(CommandReadError::Stop(None)),
             Err(ValueReadError::Invalid { message, .. }) => {
                 let message = format!("invalid RESP value: {}", message);
                 Err(CommandReadError::Invalid(vec![Value::SimpleError(message)]))
             }
             Err(err) => {
                 println!("I/O error reading command: {}", err);
-                Err(CommandReadError::Stop)
+                Err(CommandReadError::Stop(Some(Box::new(err))))
             }
         }
     }

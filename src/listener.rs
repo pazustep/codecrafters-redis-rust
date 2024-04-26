@@ -1,6 +1,6 @@
-use crate::protocol::{CommandReadError, CommandReader, Value, ValueReader, ValueWriter};
+use crate::protocol::{Command, CommandReadError, CommandReader, Value, ValueReader, ValueWriter};
 use crate::server::{ServerHandle, ServerOptions};
-use std::io;
+use std::{io, net::SocketAddr};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -40,13 +40,13 @@ async fn listen(options: ServerOptions, server: ServerHandle) -> io::Result<()> 
 }
 
 async fn handle_client(server: ServerHandle, socket: TcpStream) {
+    let address = socket.peer_addr().unwrap();
     let (socket_reader, socket_writer) = socket.into_split();
     let (values_sender, values_receiver) = mpsc::unbounded_channel::<Vec<Value>>();
 
-    let reader_handle =
-        tokio::spawn(
-            async move { handle_client_reader(server, socket_reader, values_sender).await },
-        );
+    let reader_handle = tokio::spawn(async move {
+        handle_client_reader(server, address, socket_reader, values_sender).await
+    });
 
     let writer_handle =
         tokio::spawn(async move { handle_client_writer(socket_writer, values_receiver).await });
@@ -59,6 +59,7 @@ async fn handle_client(server: ServerHandle, socket: TcpStream) {
 
 async fn handle_client_reader<R>(
     server: ServerHandle,
+    address: SocketAddr,
     socket_reader: R,
     values_sender: mpsc::UnboundedSender<Vec<Value>>,
 ) where
@@ -69,9 +70,13 @@ async fn handle_client_reader<R>(
     loop {
         match reader.read().await {
             Ok(command) => {
-                if let Err(err) = server.send(command, values_sender.clone()) {
+                if let Err(err) = server.send(command.clone(), values_sender.clone()) {
                     println!("failed to send command to server: {:?}", err);
                     break;
+                }
+
+                if let Command::Psync { .. } = command {
+                    server.add_replica(address, values_sender.clone());
                 }
             }
             Err(CommandReadError::Invalid(values)) => {
@@ -80,7 +85,11 @@ async fn handle_client_reader<R>(
                     break;
                 }
             }
-            Err(CommandReadError::Stop) => {
+            Err(CommandReadError::Stop(cause)) => {
+                if let Some(cause) = cause {
+                    println!("fatal error reading command: {}", cause);
+                }
+
                 break;
             }
         }

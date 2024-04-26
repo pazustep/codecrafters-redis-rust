@@ -1,10 +1,15 @@
 mod database;
 mod replication;
 
-use crate::protocol::{Command, Value};
+use crate::{
+    protocol::{Command, Value},
+    server::replication::ReplicationManager,
+};
 use database::Database;
-use std::{collections::HashMap, time::Duration};
-use tokio::sync::mpsc;
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use tokio::sync::{mpsc, oneshot};
+
+use self::replication::ReplicationError;
 
 #[derive(Clone)]
 pub struct ServerOptions {
@@ -14,12 +19,12 @@ pub struct ServerOptions {
 
 #[derive(Clone)]
 pub struct ServerHandle {
-    sender: mpsc::UnboundedSender<CommandEnvelope>,
+    sender: mpsc::UnboundedSender<ServerMessage>,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("failed to send command to server: {0:?}")]
-pub struct ServerSendError(Command);
+#[error("failed to send command to server")]
+pub struct ServerSendError;
 
 impl ServerHandle {
     pub fn send(
@@ -27,34 +32,60 @@ impl ServerHandle {
         command: Command,
         reply_to: mpsc::UnboundedSender<Vec<Value>>,
     ) -> Result<(), ServerSendError> {
-        let envelope = CommandEnvelope { command, reply_to };
+        let envelope = ServerMessage::ProcessCommand { command, reply_to };
+        self.sender.send(envelope).map_err(|_| ServerSendError)
+    }
 
-        self.sender
-            .send(envelope)
-            .map_err(|err| ServerSendError(err.0.command))
+    pub fn add_replica(
+        &self,
+        address: SocketAddr,
+        values_sender: mpsc::UnboundedSender<Vec<Value>>,
+    ) -> Result<(), ServerSendError> {
+        let message = ServerMessage::AddReplica {
+            address,
+            values_sender,
+        };
+        self.sender.send(message).map_err(|_| ServerSendError)
     }
 }
 
-struct CommandEnvelope {
-    command: Command,
-    reply_to: mpsc::UnboundedSender<Vec<Value>>,
+enum ServerMessage {
+    ProcessCommand {
+        command: Command,
+        reply_to: mpsc::UnboundedSender<Vec<Value>>,
+    },
+    AddReplica {
+        address: SocketAddr,
+        values_sender: mpsc::UnboundedSender<Vec<Value>>,
+    },
 }
 
 pub fn start(options: ServerOptions) -> ServerHandle {
-    let (tx, rx) = mpsc::unbounded_channel::<CommandEnvelope>();
+    let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
     let server = ServerHandle { sender: tx };
 
-    replication::start(options.clone(), server.clone());
-    tokio::spawn(async move { command_loop(options, rx).await });
+    let repl_init = replication::start(options.clone(), server.clone());
+    tokio::spawn(async move { command_loop(options, repl_init, rx).await });
 
     server
 }
 
 async fn command_loop(
     options: ServerOptions,
-    mut receiver: mpsc::UnboundedReceiver<CommandEnvelope>,
+    repl_init: oneshot::Receiver<Result<(), ReplicationError>>,
+    mut receiver: mpsc::UnboundedReceiver<ServerMessage>,
 ) {
     let mut server = Server::new(options);
+
+    match repl_init.await.unwrap() {
+        Ok(()) => {
+            println!("replica initialization completed successfully; now processing commands")
+        }
+        Err(err) => {
+            println!("failed to start replication: {}", err);
+            return;
+        }
+    }
 
     loop {
         match receiver.recv().await {
@@ -62,11 +93,20 @@ async fn command_loop(
                 println!("server channel closed; exiting task");
                 break;
             }
-            Some(envelope) => {
-                let response = server.handle(envelope.command);
-                if envelope.reply_to.send(response).is_err() {
+            Some(ServerMessage::ProcessCommand { command, reply_to }) => {
+                let response = server.handle(command.clone());
+
+                if reply_to.send(response).is_err() {
                     println!("failed to send response to client; ignoring");
+                } else {
+                    server.replication.replicate(&command);
                 }
+            }
+            Some(ServerMessage::AddReplica {
+                address,
+                values_sender,
+            }) => {
+                server.replication.add(address, values_sender);
             }
         }
     }
@@ -75,6 +115,7 @@ async fn command_loop(
 struct Server {
     options: ServerOptions,
     database: Database,
+    replication: ReplicationManager,
 }
 
 impl Server {
@@ -82,6 +123,7 @@ impl Server {
         Self {
             options,
             database: Database::new(),
+            replication: ReplicationManager::new(),
         }
     }
 
@@ -92,6 +134,8 @@ impl Server {
             Command::Get { key } => self.get(key),
             Command::Set { key, value, expiry } => self.set(key, value, expiry),
             Command::Info { .. } => self.info(),
+            Command::Replconf { .. } => self.replconf(),
+            Command::Psync { .. } => self.psync(),
             _ => vec![Value::simple_error("ERR unhandled command")],
         }
     }
@@ -142,5 +186,24 @@ impl Server {
             .join("\r\n");
 
         vec![Value::BulkString(result.into_bytes())]
+    }
+
+    fn replconf(&self) -> Vec<Value> {
+        vec![Value::simple_string("OK")]
+    }
+
+    fn psync(&self) -> Vec<Value> {
+        let rdb = vec![
+            82, 69, 68, 73, 83, 48, 48, 49, 49, 250, 9, 114, 101, 100, 105, 115, 45, 118, 101, 114,
+            5, 55, 46, 50, 46, 48, 250, 10, 114, 101, 100, 105, 115, 45, 98, 105, 116, 115, 192,
+            64, 250, 5, 99, 116, 105, 109, 101, 194, 109, 8, 188, 101, 250, 8, 117, 115, 101, 100,
+            45, 109, 101, 109, 194, 176, 196, 16, 0, 250, 8, 97, 111, 102, 45, 98, 97, 115, 101,
+            192, 0, 255, 240, 110, 59, 254, 192, 255, 90, 162,
+        ];
+
+        vec![
+            Value::simple_string("FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0"),
+            Value::BulkBytes(rdb),
+        ]
     }
 }

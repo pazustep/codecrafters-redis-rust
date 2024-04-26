@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use crate::{
     protocol::{Command, CommandReadError, CommandReader, Value, ValueReader, ValueWriter},
     server::{ServerHandle, ServerOptions},
@@ -113,8 +115,10 @@ async fn replication_loop(
             Err(CommandReadError::Invalid(values)) => {
                 println!("ignoring invalid command from master: {:?}", values);
             }
-            Err(CommandReadError::Stop) => {
-                println!("fatal error reading command from master");
+            Err(CommandReadError::Stop(cause)) => {
+                if let Some(cause) = cause {
+                    println!("error reading command from master: {}", cause);
+                }
                 break;
             }
         }
@@ -128,8 +132,8 @@ pub struct ReplicationManager {
 }
 
 struct Replica {
-    address: String,
-    values_sender: mpsc::UnboundedSender<Value>,
+    address: SocketAddr,
+    values_sender: mpsc::UnboundedSender<Vec<Value>>,
 }
 
 impl ReplicationManager {
@@ -137,11 +141,12 @@ impl ReplicationManager {
         Self { replicas: vec![] }
     }
 
-    pub fn add(&mut self, address: String, values_sender: mpsc::UnboundedSender<Value>) {
+    pub fn add(&mut self, address: SocketAddr, values_sender: mpsc::UnboundedSender<Vec<Value>>) {
         self.replicas.push(Replica {
             address,
             values_sender,
         });
+        println!("added replica: {}", address);
     }
 
     pub fn replicate(&mut self, command: &Command) {
@@ -156,7 +161,7 @@ fn send_to_replica(replica: &Replica, command: &Command) -> bool {
     let address = &replica.address;
     let value = command.to_value();
 
-    match channel.send(value) {
+    match channel.send(vec![value]) {
         Ok(_) => true,
         Err(err) => {
             println!("failed to replicate command to {}: {}", address, err);
