@@ -93,21 +93,47 @@ async fn init(
 async fn replication_loop(
     server: ServerHandle,
     reader: ValueReader<BufReader<OwnedReadHalf>>,
-    _writer: ValueWriter<BufWriter<OwnedWriteHalf>>, // we need to keep this alive
+    mut writer: ValueWriter<BufWriter<OwnedWriteHalf>>, // we need to keep this alive
 ) {
     let mut reader = CommandReader::new(reader);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    // a channel that will ignore all received values
+    let (black_hole_sender, mut black_hole_receiver) = mpsc::unbounded_channel();
+
+    // a channel to write values to the replication connection
+    let (values_sender, mut values_receiver) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        while rx.recv().await.is_some() {
+        while black_hole_receiver.recv().await.is_some() {
             // do nothing — we don't send replies to replica commands
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(values) = values_receiver.recv().await {
+            for value in values {
+                if let Err(err) = writer.write(&value).await {
+                    println!("failed to write reply to master: {}", err);
+                    return;
+                }
+            }
         }
     });
 
     loop {
         match reader.read().await {
             Ok(command) => {
-                if let Err(err) = server.send(command, tx.clone()) {
+                let reply_to = match &command {
+                    Command::Replconf { key, .. }
+                        if String::from_utf8_lossy(key).to_uppercase() == "GETACK" =>
+                    {
+                        println!("using real response channel for command {:?}", command);
+                        values_sender.clone()
+                    }
+                    _ => black_hole_sender.clone(),
+                };
+
+                if let Err(err) = server.send(command, reply_to) {
                     println!("failed to send command to server: {:?}", err);
                     break;
                 }

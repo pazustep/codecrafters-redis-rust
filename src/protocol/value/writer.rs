@@ -24,7 +24,7 @@ where
             Value::Array(values) => self.write_array(&values).await,
             Value::NullBulkString => self.write_null_bulk_string().await,
             Value::NullArray => self.write_null_array().await,
-        }?;
+        };
 
         self.writer.flush().await
     }

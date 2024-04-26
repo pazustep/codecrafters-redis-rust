@@ -134,9 +134,8 @@ impl Server {
             Command::Get { key } => self.get(key),
             Command::Set { key, value, expiry } => self.set(key, value, expiry),
             Command::Info { .. } => self.info(),
-            Command::Replconf { .. } => self.replconf(),
+            Command::Replconf { key, value } => self.replconf(&key, &value),
             Command::Psync { .. } => self.psync(),
-            _ => vec![Value::simple_error("ERR unhandled command")],
         }
     }
 
@@ -188,8 +187,12 @@ impl Server {
         vec![Value::BulkString(result.into_bytes())]
     }
 
-    fn replconf(&self) -> Vec<Value> {
-        vec![Value::simple_string("OK")]
+    fn replconf(&self, key: &[u8], _value: &[u8]) -> Vec<Value> {
+        if String::from_utf8_lossy(key).to_uppercase() == "GETACK" {
+            vec![Value::command_str("REPLCONF", &["ACK", "0"])]
+        } else {
+            vec![Value::simple_string("OK")]
+        }
     }
 
     fn psync(&self) -> Vec<Value> {

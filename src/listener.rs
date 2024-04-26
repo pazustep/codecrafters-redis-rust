@@ -76,7 +76,9 @@ async fn handle_client_reader<R>(
                 }
 
                 if let Command::Psync { .. } = command {
-                    server.add_replica(address, values_sender.clone());
+                    if let Err(err) = server.add_replica(address, values_sender.clone()) {
+                        println!("failed to add replica: {:?}", err);
+                    }
                 }
             }
             Err(CommandReadError::Invalid(values)) => {
