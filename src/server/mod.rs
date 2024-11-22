@@ -116,6 +116,7 @@ struct Server {
     options: ServerOptions,
     database: Database,
     replication: ReplicationManager,
+    offset: usize,
 }
 
 impl Server {
@@ -124,44 +125,56 @@ impl Server {
             options,
             database: Database::new(),
             replication: ReplicationManager::new(),
+            offset: 0,
         }
     }
 
     fn handle(&mut self, command: Command) -> Vec<Value> {
-        match command {
-            Command::Ping { message } => self.ping(message),
-            Command::Echo { message } => self.echo(message),
-            Command::Get { key } => self.get(key),
-            Command::Set { key, value, expiry } => self.set(key, value, expiry),
-            Command::Info { .. } => self.info(),
-            Command::Replconf { key, value } => self.replconf(&key, &value),
-            Command::Psync { .. } => self.psync(),
-        }
+        let (size, response) = match command {
+            Command::Ping { size, message } => (size, self.ping(message)),
+            Command::Echo { size, message } => (size, self.echo(message)),
+            Command::Get { size, key, .. } => (size, self.get(key)),
+            Command::Set {
+                size,
+                key,
+                value,
+                expiry,
+                ..
+            } => (size, self.set(key, value, expiry)),
+            Command::Info { size, .. } => (size, self.info()),
+            Command::Replconf {
+                size, key, value, ..
+            } => (size, self.replconf(&key, &value)),
+            Command::Psync { size, .. } => (size, self.psync()),
+        };
+
+        self.offset += size;
+        response
     }
 
     fn ping(&self, message: Option<Vec<u8>>) -> Vec<Value> {
         let response = match message {
             None => Value::simple_string("PONG"),
-            Some(message) => Value::BulkString(message),
+            Some(message) => Value::bulk_string_from_bytes(message),
         };
 
         vec![response]
     }
 
     fn echo(&self, message: Vec<u8>) -> Vec<Value> {
-        vec![Value::BulkString(message)]
+        vec![Value::bulk_string_from_bytes(message)]
     }
 
     fn get(&mut self, key: Vec<u8>) -> Vec<Value> {
         match self.database.get(key) {
-            Some(value) => vec![Value::BulkString(value)],
+            Some(value) => vec![Value::bulk_string_from_bytes(value)],
             None => vec![Value::NullBulkString],
         }
     }
 
     fn set(&mut self, key: Vec<u8>, value: Vec<u8>, expiry: Option<Duration>) -> Vec<Value> {
         self.database.set(key, value, expiry);
-        vec![Value::simple_string("OK")]
+        vec![Value::ok()]
     }
 
     fn info(&self) -> Vec<Value> {
@@ -184,14 +197,15 @@ impl Server {
             .collect::<Vec<_>>()
             .join("\r\n");
 
-        vec![Value::BulkString(result.into_bytes())]
+        vec![Value::bulk_string_from_bytes(result.into_bytes())]
     }
 
     fn replconf(&self, key: &[u8], _value: &[u8]) -> Vec<Value> {
         if String::from_utf8_lossy(key).to_uppercase() == "GETACK" {
-            vec![Value::command_str("REPLCONF", &["ACK", "0"])]
+            let offset = format!("{}", self.offset);
+            vec![Value::command_str("REPLCONF", &["ACK", &offset])]
         } else {
-            vec![Value::simple_string("OK")]
+            vec![Value::ok()]
         }
     }
 
@@ -206,7 +220,7 @@ impl Server {
 
         vec![
             Value::simple_string("FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0"),
-            Value::BulkBytes(rdb),
+            Value::BulkBytes((rdb.len(), rdb)),
         ]
     }
 }

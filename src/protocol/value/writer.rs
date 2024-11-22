@@ -15,21 +15,17 @@ where
     }
 
     pub async fn write(&mut self, value: &Value) -> io::Result<()> {
-        match value {
-            Value::SimpleString(val) => self.write_simple_string(val).await,
-            Value::SimpleError(val) => self.write_simple_error(val).await,
-            Value::Integer(val) => self.write_integer(*val).await,
-            Value::BulkString(bytes) => self.write_bulk_string(&bytes).await,
-            Value::BulkBytes(bytes) => self.write_bulk_bytes(&bytes).await,
-            Value::Array(values) => self.write_array(&values).await,
+        let _ = match value {
+            Value::SimpleString((_, val)) => self.write_simple_string(val).await,
+            Value::SimpleError((_, val)) => self.write_simple_error(val).await,
+            Value::Integer((_, val)) => self.write_integer(*val).await,
+            Value::BulkString((_, bytes)) => self.write_bulk_string(bytes).await,
+            Value::BulkBytes((_, bytes)) => self.write_bulk_bytes(bytes).await,
+            Value::Array((_, values)) => self.write_array(values).await,
             Value::NullBulkString => self.write_null_bulk_string().await,
             Value::NullArray => self.write_null_array().await,
         };
 
-        self.writer.flush().await
-    }
-
-    pub async fn flush(&mut self) -> io::Result<()> {
         self.writer.flush().await
     }
 

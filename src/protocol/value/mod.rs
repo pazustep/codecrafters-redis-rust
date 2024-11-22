@@ -6,17 +6,17 @@ pub use writer::*;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Value {
-    SimpleString(String),
+    SimpleString((usize, String)),
 
-    SimpleError(String),
+    SimpleError((usize, String)),
 
-    Integer(i64),
+    Integer((usize, i64)),
 
-    BulkString(Vec<u8>),
+    BulkString((usize, Vec<u8>)),
 
-    BulkBytes(Vec<u8>),
+    BulkBytes((usize, Vec<u8>)),
 
-    Array(Vec<Value>),
+    Array((usize, Vec<Value>)),
 
     NullBulkString,
 
@@ -25,19 +25,18 @@ pub enum Value {
 
 impl Value {
     pub fn simple_string(value: &str) -> Self {
-        Self::SimpleString(value.to_string())
+        let len = format!("{}", value.len());
+        Self::SimpleString((len.len() + 3, value.to_string()))
     }
 
     pub fn simple_error(value: &str) -> Self {
-        Self::SimpleError(value.to_string())
-    }
-
-    pub fn integer(value: i64) -> Self {
-        Self::Integer(value)
+        let len = format!("{}", value.len());
+        Self::SimpleError((len.len() + 3, value.to_string()))
     }
 
     pub fn bulk_string_from_bytes(value: Vec<u8>) -> Self {
-        Self::BulkString(value)
+        let len = format!("{}", value.len());
+        Self::BulkString((len.len() + 3, value))
     }
 
     pub fn bulk_string(value: &str) -> Self {
@@ -45,28 +44,47 @@ impl Value {
     }
 
     pub fn command(command: &str, args: &[&Vec<u8>]) -> Self {
-        let mut array = Vec::with_capacity(args.len() + 1);
-        array.push(Self::bulk_string(command));
-
-        for arg in args {
-            array.push(Self::BulkString((*arg).clone()));
-        }
-
-        Self::Array(array)
+        build_command(command, args.iter().map(|arg| (*arg).clone()))
     }
 
     pub fn command_str(command: &str, args: &[&str]) -> Self {
-        let mut array = Vec::with_capacity(args.len() + 1);
-        array.push(Self::bulk_string(command));
-
-        for arg in args {
-            array.push(Self::bulk_string(arg));
-        }
-
-        Self::Array(array)
+        build_command(command, args.iter().map(|arg| arg.as_bytes().to_vec()))
     }
 
     pub fn ok() -> Self {
-        Self::SimpleString("OK".to_string())
+        Self::simple_string("OK")
     }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Value::SimpleString((size, _)) => *size,
+            Value::SimpleError((size, _)) => *size,
+            Value::Integer((size, _)) => *size,
+            Value::BulkString((size, _)) => *size,
+            Value::BulkBytes((size, _)) => *size,
+            Value::Array((size, _)) => *size,
+            Value::NullBulkString => 5,
+            Value::NullArray => 5,
+        }
+    }
+}
+
+fn build_command(command: &str, args: impl Iterator<Item = Vec<u8>>) -> Value {
+    let command = Value::bulk_string(command);
+    let mut array = match args.size_hint() {
+        (_, Some(upper)) => Vec::with_capacity(upper + 1),
+        _ => Vec::new(),
+    };
+
+    let mut parts_size = command.size();
+    array.push(command);
+
+    for arg in args {
+        let arg = Value::bulk_string_from_bytes(arg);
+        parts_size += arg.size();
+        array.push(arg);
+    }
+
+    let len = format!("{}", array.len());
+    Value::Array((len.len() + 3 + parts_size, array))
 }

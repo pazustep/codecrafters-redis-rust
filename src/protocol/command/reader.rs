@@ -29,7 +29,9 @@ where
             Err(ValueReadError::EndOfInput) => Err(CommandReadError::Stop(None)),
             Err(ValueReadError::Invalid { message, .. }) => {
                 let message = format!("invalid RESP value: {}", message);
-                Err(CommandReadError::Invalid(vec![Value::SimpleError(message)]))
+                Err(CommandReadError::Invalid(vec![Value::simple_error(
+                    &message,
+                )]))
             }
             Err(err) => {
                 println!("I/O error reading command: {}", err);
@@ -44,7 +46,9 @@ fn parse_command(value: Value) -> Result<Command, CommandReadError> {
         Ok(command) => Ok(command),
         Err(err) => {
             let message = format!("{}", err);
-            Err(CommandReadError::Invalid(vec![Value::SimpleError(message)]))
+            Err(CommandReadError::Invalid(vec![Value::simple_error(
+                &message,
+            )]))
         }
     }
 }

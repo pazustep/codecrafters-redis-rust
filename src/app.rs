@@ -4,30 +4,24 @@ use crate::server::ServerOptions;
 enum ArgState {
     Normal,
     Port,
-    ReplicaHost,
-    ReplicaPort,
+    ReplicaOf,
 }
 
 pub fn parse_options() -> ServerOptions {
     let mut state = ArgState::Normal;
     let mut port: Option<u16> = None;
-    let mut replica_host: Option<String> = None;
-    let mut replica_port: Option<u16> = None;
+    let mut replica_of: Option<String> = None;
 
     for arg in std::env::args().skip(1) {
         match (state, arg.as_str()) {
             (ArgState::Normal, "--port") => state = ArgState::Port,
-            (ArgState::Normal, "--replicaof") => state = ArgState::ReplicaHost,
+            (ArgState::Normal, "--replicaof") => state = ArgState::ReplicaOf,
             (ArgState::Port, value) => {
                 port = value.parse().ok();
                 state = ArgState::Normal;
             }
-            (ArgState::ReplicaHost, value) => {
-                replica_host = Some(value.to_string());
-                state = ArgState::ReplicaPort;
-            }
-            (ArgState::ReplicaPort, value) => {
-                replica_port = value.parse().ok();
+            (ArgState::ReplicaOf, value) => {
+                replica_of = Some(value.replace(' ', ":"));
                 state = ArgState::Normal;
             }
             (_, value) => {
@@ -35,11 +29,6 @@ pub fn parse_options() -> ServerOptions {
             }
         }
     }
-
-    let replica_of = replica_host.map(|host| {
-        let port = replica_port.unwrap_or(DEFAULT_PORT);
-        format!("{}:{}", host, port)
-    });
 
     ServerOptions {
         port: port.unwrap_or(DEFAULT_PORT),
