@@ -47,6 +47,13 @@ pub fn to_value(command: &Command) -> Value {
 
             Value::command("PSYNC", &[replid, &offset.as_bytes().to_vec()])
         }
+        Command::Wait {
+            replicas, timeout, ..
+        } => {
+            let replicas = replicas.to_string().into_bytes();
+            let timeout = timeout.to_string().into_bytes();
+            Value::command("WAIT", &[&replicas, &timeout])
+        }
     }
 }
 

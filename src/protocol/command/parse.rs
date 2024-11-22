@@ -1,5 +1,5 @@
 use crate::protocol::{Command, Value};
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, fmt::Display, str::FromStr, time::Duration};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -58,6 +58,7 @@ fn from_parts(size: usize, mut values: VecDeque<Vec<u8>>) -> Result<Command, Fro
         "INFO" => parse_info(size, values),
         "REPLCONF" => parse_replconf(size, values),
         "PSYNC" => parse_psync(size, values),
+        "WAIT" => parse_wait(size, values),
         cmd => invalid_command(cmd),
     }
 }
@@ -114,12 +115,7 @@ fn parse_set_expiry(mut args: VecDeque<Vec<u8>>) -> Result<Duration, FromValueEr
         .pop_front()
         .ok_or_else(|| wrong_number_of_arguments("SET PX"))?;
 
-    let text = from_utf8(bytes)?;
-
-    let expiry = text
-        .parse::<u64>()
-        .map_err(|_| "invalid integer value for SET PX argument")?;
-
+    let expiry = parse_number(bytes, "integer value for SET PX argument")?;
     Ok(Duration::from_millis(expiry))
 }
 
@@ -165,11 +161,7 @@ fn parse_psync_replid(replid: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 fn parse_psync_offset(offset: Vec<u8>) -> Result<Option<u32>, FromValueError> {
-    let offset = from_utf8(offset)?;
-
-    let offset = offset
-        .parse::<i64>()
-        .map_err(|_| FromValueError(format!("invalid PSYNC offset: {}", offset)))?;
+    let offset: i64 = parse_number(offset, "PSYNC offset")?;
 
     if offset < 0 {
         Ok(None)
@@ -178,12 +170,39 @@ fn parse_psync_offset(offset: Vec<u8>) -> Result<Option<u32>, FromValueError> {
     }
 }
 
+fn parse_wait(size: usize, mut args: VecDeque<Vec<u8>>) -> Result<Command, FromValueError> {
+    if args.len() < 2 {
+        return Err(wrong_number_of_arguments("WAIT"));
+    }
+
+    let replicas = parse_number(args.pop_front().unwrap(), "invalid value for replica count")?;
+    let timeout = parse_number(args.pop_front().unwrap(), "invalid value for timeout")?;
+
+    Ok(Command::Wait {
+        size,
+        replicas,
+        timeout,
+    })
+}
+
 fn invalid_command(command: &str) -> Result<Command, FromValueError> {
     Err(FromValueError(format!("invalid command: {}", command)))
 }
 
 fn from_utf8(bytes: Vec<u8>) -> Result<String, FromValueError> {
     String::from_utf8(bytes).map_err(|_| "invalid UTF-8".into())
+}
+
+fn parse_number<T>(bytes: Vec<u8>, desc: &str) -> Result<T, FromValueError>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    let text = from_utf8(bytes)?;
+    text.parse().map_err(|_| {
+        let message = format!("invalid {}: {}", desc, text);
+        FromValueError(message)
+    })
 }
 
 #[cfg(test)]

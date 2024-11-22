@@ -25,18 +25,18 @@ pub enum Value {
 
 impl Value {
     pub fn simple_string(value: &str) -> Self {
-        let len = format!("{}", value.len());
-        Self::SimpleString((len.len() + 3, value.to_string()))
+        let len_size = value.len().to_string().len();
+        Self::SimpleString((len_size + 3, value.to_string()))
     }
 
     pub fn simple_error(value: &str) -> Self {
-        let len = format!("{}", value.len());
-        Self::SimpleError((len.len() + 3, value.to_string()))
+        let len_size = value.len().to_string().len();
+        Self::SimpleError((len_size + 3, value.to_string()))
     }
 
     pub fn bulk_string_from_bytes(value: Vec<u8>) -> Self {
-        let len = format!("{}", value.len());
-        Self::BulkString((len.len() + 3, value))
+        let len_size = value.len().to_string().len();
+        Self::BulkString((len_size + 3, value))
     }
 
     pub fn bulk_string(value: &str) -> Self {
@@ -49,6 +49,11 @@ impl Value {
 
     pub fn command_str(command: &str, args: &[&str]) -> Self {
         build_command(command, args.iter().map(|arg| arg.as_bytes().to_vec()))
+    }
+
+    pub fn integer(value: i64) -> Self {
+        let size = value.to_string().len();
+        Self::Integer((size, value))
     }
 
     pub fn ok() -> Self {

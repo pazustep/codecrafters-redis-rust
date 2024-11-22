@@ -146,6 +146,7 @@ impl Server {
                 size, key, value, ..
             } => (size, self.replconf(&key, &value)),
             Command::Psync { size, .. } => (size, self.psync()),
+            Command::Wait { size, .. } => (size, self.wait()),
         };
 
         self.offset += size;
@@ -222,5 +223,9 @@ impl Server {
             Value::simple_string("FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0"),
             Value::BulkBytes((rdb.len(), rdb)),
         ]
+    }
+
+    fn wait(&self) -> Vec<Value> {
+        vec![Value::integer(0)]
     }
 }

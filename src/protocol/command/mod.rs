@@ -48,6 +48,12 @@ pub enum Command {
         master_replid: Option<Vec<u8>>,
         master_repl_offset: Option<u32>,
     },
+
+    Wait {
+        size: usize,
+        replicas: u32,
+        timeout: u64,
+    },
 }
 
 impl Command {
