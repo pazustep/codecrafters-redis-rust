@@ -226,6 +226,7 @@ impl Server {
     }
 
     fn wait(&self) -> Vec<Value> {
-        vec![Value::integer(0)]
+        let connected = self.replication.connected_replicas();
+        vec![Value::integer(connected)]
     }
 }

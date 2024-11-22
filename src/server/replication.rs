@@ -180,6 +180,10 @@ impl ReplicationManager {
             self.replicas.retain(|r| send_to_replica(r, command));
         }
     }
+
+    pub fn connected_replicas(&self) -> i64 {
+        self.replicas.len() as i64
+    }
 }
 
 fn send_to_replica(replica: &Replica, command: &Command) -> bool {
